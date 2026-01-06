@@ -7,6 +7,7 @@ from tqdm import tqdm
 import torchvision
 from loguru import logger
 from PIL import Image
+import open3d as o3d
 
 from pytorch3d.renderer import look_at_view_transform
 from pytorch3d.transforms import Transform3d
@@ -20,7 +21,7 @@ from sam3d_objects.data.dataset.tdfy.transforms_3d import (
     DecomposedTransform,
 )
 from sam3d_objects.pipeline.utils.pointmap import infer_intrinsics_from_pointmap
-from sam3d_objects.pipeline.inference_utils import o3d_plane_estimation, estimate_plane_area
+from sam3d_objects.pipeline.inference_utils import o3d_plane_estimation, estimate_plane_area, layout_post_optimization
 
 
 def camera_to_pytorch3d_camera(device="cpu") -> DecomposedTransform:
@@ -91,7 +92,7 @@ def compile_wrapper(
 class InferencePipelinePointMap(InferencePipeline):
 
     def __init__(
-        self, *args, depth_model, layout_post_optimization_method=None, clip_pointmap_beyond_scale=None, **kwargs
+        self, *args, depth_model, layout_post_optimization_method=layout_post_optimization, clip_pointmap_beyond_scale=None, **kwargs
     ):
         self.depth_model = depth_model
         self.layout_post_optimization_method = layout_post_optimization_method
@@ -339,7 +340,7 @@ class InferencePipelinePointMap(InferencePipeline):
             pts_colors = type(self)._down_sample_img(pointmap_dict["pts_color"])
 
             if estimate_plane:
-                return self.estimate_plane(pointmap_dict, image)
+                return self.estimate_plane2(pointmap_dict, image)
 
             ss_input_dict = self.preprocess_image(
                 image, self.ss_preprocessor, pointmap=pointmap
@@ -484,6 +485,203 @@ class InferencePipelinePointMap(InferencePipeline):
         else:
             logger.info(f"Skipping plane estimation: area={overlap_area:.3f}, points={len(points)}")
             mesh = None
+
+        return {
+            "glb": mesh,
+            "translation": torch.tensor([[0.0, 0.0, 0.0]]),
+            "scale": torch.tensor([[1.0, 1.0, 1.0]]),
+            "rotation": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        }
+
+    def estimate_plane2(
+        self,
+        pointmap_dict,
+        image,
+        ground_area_threshold=0.25,
+        min_points=100,
+        # ---- robust defaults ----
+        max_planes=6,
+        ransac_n=3,
+        num_iterations=2500,
+        distance_threshold=0.02,
+        min_inliers=300,
+        # scoring weights
+        w_support=1.0,      # inlier ratio
+        w_flatness=0.8,     # how planar the inliers are (PCA thickness)
+        w_lowness=1.4,      # prefer plane near a global "lower extreme" (auto from candidate sign)
+    ):
+        """
+        View-agnostic ground plane estimation.
+        Keeps SAM3D IO shape/keys compatible.
+
+        Returns SAM3D-style dict:
+        glb(mesh or None), translation(1,3), scale(1,3), rotation(1,4 quat)
+        """
+        assert image.shape[-1] == 4  # rgba format
+
+        # Mask from alpha channel (same as original)
+        floor_mask = type(self)._down_sample_img(torch.from_numpy(image[..., -1]).float().unsqueeze(0))[0] > 0.5
+        pts = type(self)._down_sample_img(pointmap_dict["pointmap"])
+
+        # (H,W,3)
+        pts_hwc = pts.detach().cpu().permute((1, 2, 0))
+        valid_mask_points = floor_mask.detach().cpu().numpy()
+
+        if valid_mask_points.any():
+            masked_points = pts_hwc[valid_mask_points]  # (N,3) torch
+            valid_points_mask = torch.norm(masked_points, dim=-1) > 1e-6
+            valid_points = masked_points[valid_points_mask]
+            points = valid_points.detach().cpu().numpy().astype(np.float64)
+        else:
+            points = np.empty((0, 3), dtype=np.float64)
+
+        overlap_area = estimate_plane_area(floor_mask)
+        has_enough_points = len(points) >= min_points
+
+        logger.info(f"Plane estimation: {len(points)} points, {overlap_area:.3f} area coverage")
+
+        if not (overlap_area > ground_area_threshold and has_enough_points):
+            logger.info(f"Skipping plane estimation: area={overlap_area:.3f}, points={len(points)}")
+            return {
+                "glb": None,
+                "translation": torch.tensor([[0.0, 0.0, 0.0]]),
+                "scale": torch.tensor([[1.0, 1.0, 1.0]]),
+                "rotation": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            }
+
+        # Open3D point cloud
+        pcd0 = o3d.geometry.PointCloud()
+        pcd0.points = o3d.utility.Vector3dVector(points)
+
+        # Precompute global scale for normalization
+        # We'll use global projection ranges along candidate normals.
+        best = None
+        remaining = pcd0
+
+        def pca_flatness(inlier_pts: np.ndarray):
+            """
+            Returns thickness ratio: smallest eigenvalue / sum eigenvalues (smaller => flatter plane).
+            """
+            if inlier_pts.shape[0] < 10:
+                return 1.0
+            X = inlier_pts - inlier_pts.mean(axis=0, keepdims=True)
+            C = (X.T @ X) / max(X.shape[0] - 1, 1)
+            evals = np.linalg.eigvalsh(C)
+            s = float(np.sum(evals))
+            if s < 1e-12:
+                return 1.0
+            return float(evals[0] / s)  # thickness ratio
+
+        # Find multiple plane candidates
+        for k in range(max_planes):
+            if len(remaining.points) < max(min_inliers, ransac_n):
+                break
+
+            try:
+                plane_model, inliers = remaining.segment_plane(
+                    distance_threshold=distance_threshold,
+                    ransac_n=ransac_n,
+                    num_iterations=num_iterations,
+                )
+            except Exception as e:
+                logger.error(f"Open3D plane segmentation failed: {e}")
+                break
+
+            inliers = np.asarray(inliers, dtype=np.int64)
+            if inliers.size < min_inliers:
+                break
+
+            a, b, c, d = [float(x) for x in plane_model]
+            n = np.array([a, b, c], dtype=np.float64)
+            nn = float(np.linalg.norm(n))
+            if nn < 1e-12:
+                remaining = remaining.select_by_index(inliers.tolist(), invert=True)
+                continue
+            n = n / nn
+
+            pts_rem = np.asarray(remaining.points)
+            inlier_pts = pts_rem[inliers]
+
+            # Score components
+            support = inliers.size / max(len(remaining.points), 1)  # local support
+            thickness = pca_flatness(inlier_pts)                   # smaller is better
+            flatness_score = 1.0 - np.clip(thickness * 50.0, 0.0, 1.0)  # heuristic mapping
+
+            # "Lowness" WITHOUT known up:
+            # We evaluate both normal directions (+n and -n), pick direction where the plane sits
+            # closer to the "lower extreme" (smaller projection) of all masked points.
+            # For each direction u, compare mean projection of plane inliers vs global min projection.
+            # floor should be near the min in that axis direction.
+            all_pts = points
+            proj_all_pos = all_pts @ n
+            proj_all_neg = all_pts @ (-n)
+
+            # global mins
+            min_pos = float(np.min(proj_all_pos))
+            min_neg = float(np.min(proj_all_neg))
+
+            mean_pos = float(np.mean(inlier_pts @ n))
+            mean_neg = float(np.mean(inlier_pts @ (-n)))
+
+            range_pos = max(float(np.max(proj_all_pos) - min_pos), 1e-6)
+            range_neg = max(float(np.max(proj_all_neg) - min_neg), 1e-6)
+
+            # closeness to global minimum (0 is best), convert to score (1 best)
+            clos_pos = (mean_pos - min_pos) / range_pos
+            clos_neg = (mean_neg - min_neg) / range_neg
+            low_score_pos = 1.0 - np.clip(clos_pos, 0.0, 1.0)
+            low_score_neg = 1.0 - np.clip(clos_neg, 0.0, 1.0)
+
+            if low_score_neg > low_score_pos:
+                n_used = -n
+                d_used = -d
+                low_score = low_score_neg
+            else:
+                n_used = n
+                d_used = d
+                low_score = low_score_pos
+
+            score = w_support * support + w_flatness * flatness_score + w_lowness * low_score
+
+            cand = {
+                "k": k,
+                "score": float(score),
+                "n": n_used,
+                "d": float(d_used),
+                "inlier_pts": inlier_pts,
+                "support": float(support),
+                "flatness_score": float(flatness_score),
+                "low_score": float(low_score),
+                "inliers": int(inliers.size),
+            }
+
+            if (best is None) or (cand["score"] > best["score"]):
+                best = cand
+
+            # Remove this plane and continue
+            remaining = remaining.select_by_index(inliers.tolist(), invert=True)
+
+        if best is None:
+            logger.info("No plane candidate found; falling back to original estimation.")
+            try:
+                mesh = o3d_plane_estimation(points)
+                logger.info("Successfully estimated plane mesh (fallback)")
+            except Exception as e:
+                logger.error(f"Failed to estimate plane (fallback): {e}")
+                mesh = None
+        else:
+            logger.info(
+                f"Selected plane k={best['k']} score={best['score']:.3f} "
+                f"inliers={best['inliers']} support={best['support']:.3f} "
+                f"flat={best['flatness_score']:.3f} low={best['low_score']:.3f}"
+            )
+            # Build mesh from inliers (more robust)
+            try:
+                mesh = o3d_plane_estimation(best["inlier_pts"])
+                logger.info("Successfully estimated plane mesh (improved, view-agnostic)")
+            except Exception as e:
+                logger.error(f"Failed to estimate plane (improved): {e}")
+                mesh = None
 
         return {
             "glb": mesh,

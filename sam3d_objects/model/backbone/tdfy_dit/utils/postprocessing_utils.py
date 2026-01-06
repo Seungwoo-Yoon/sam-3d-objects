@@ -663,7 +663,7 @@ def to_glb(
         )
 
     # rotate mesh (from z-up to y-up)
-    vertices = vertices @ np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
+    # vertices = vertices @ np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
 
     if not with_mesh_postprocess and not with_texture_baking and use_vertex_color:
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
