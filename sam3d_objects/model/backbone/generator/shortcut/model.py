@@ -6,6 +6,7 @@ import numpy as np
 from functools import partial
 import optree
 import math
+from pytorch3d.transforms import rotation_6d_to_matrix
 
 from sam3d_objects.model.backbone.generator.base import Base
 from sam3d_objects.data.utils import right_broadcasting
@@ -14,6 +15,8 @@ from sam3d_objects.model.backbone.generator.flow_matching.model import FlowMatch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 import copy
+
+from sam3d_objects.custom.utils import *
 
 
 # https://arxiv.org/pdf/2410.12557
@@ -440,6 +443,8 @@ class ShortCut(FlowMatching):
         *args_conditionals,
         **kwargs_conditionals,
     ):
+        t_copy = t
+
         """Generate dynamics for ODE solver"""
         t = torch.tensor(
             [t * self.time_scale], device=_get_device(x_t), dtype=torch.float32
@@ -447,4 +452,71 @@ class ShortCut(FlowMatching):
         d = torch.tensor(
             [d * self.time_scale], device=_get_device(x_t), dtype=torch.float32
         )
-        return self.reverse_fn(x_t, t, *args_conditionals, d=d, **kwargs_conditionals)
+        d_pred = torch.tensor(
+            [(1 - t_copy) * self.time_scale], device=_get_device(x_t), dtype=torch.float32
+        )
+
+        pointmap = kwargs_conditionals.pop("pointmap", None)
+        pointmap_scale = kwargs_conditionals.pop("pointmap_scale", None)
+        pointmap_shift = kwargs_conditionals.pop("pointmap_shift", None)
+        ss_decoder = kwargs_conditionals.pop("ss_decoder", None)
+        
+        if pointmap is None:
+            ret = self.reverse_fn(x_t, t, *args_conditionals, d=d, **kwargs_conditionals)
+        else:
+            velocity = self.reverse_fn(x_t, t, *args_conditionals, d=d, **kwargs_conditionals) 
+
+            # TODO: measure GPU time from here
+            pred_latent = tree_tensor_map(
+                lambda x, v: x + v * (1 - t_copy), x_t, velocity
+            ) # consistency model 이어서 정확하지 않음
+
+            ss = ss_decoder(
+                pred_latent['shape'].permute(0, 2, 1)
+                .contiguous()
+                .view(pred_latent['shape'].shape[0], 8, 16, 16, 16)
+            )
+            coords = torch.argwhere(ss > 0)[:, [0, 2, 3, 4]]
+            ss_pcs = []
+            
+            for i in range(pred_latent['shape'].shape[0]):
+                ss_pc = coords[coords[:, 0] == i][:, 1:].float()
+                ss_pc = ss_pc / 64.0 - 0.5  # normalize to [-1, 1]
+                
+                scale = pred_latent['scale'][i]        # (1, 3)
+                rotation = pred_latent['6drotation_normalized'][i]  # (1, 6) 6D rotation
+                translation = pred_latent['translation'][i] # (1, 3)
+
+                scale = scale.mean(dim=-1, keepdim=True).expand_as(scale)
+                R = rotation_6d_to_matrix(rotation)[0]  # (3, 3)
+
+                ss_pc = (ss_pc * scale) @ R.T + translation  # Apply scale, rotation, translation
+
+                ss_pcs.append(ss_pc)
+
+            # (M, 3, H, W) -> (M, HW, 3)
+            pointmap_pc = pointmap.permute(0, 2, 3, 1).reshape(pointmap.shape[0], -1, 3)
+
+            # save the first batch's point clouds for debugging
+            save_multiple_pcs(
+                [
+                    ss_pcs[0].cpu().numpy(),
+                    pointmap_pc[0].cpu().numpy()
+                ],
+                f"../debug/pc_readout/{t_copy:.4f}.ply",
+                colors=[
+                    (255, 0, 0, 255),
+                    (0, 255, 0, 255)
+                ]
+            )
+
+            # TODO: measure GPU time until here
+            
+            ret = self.reverse_fn(x_t, t, *args_conditionals, d=d, **kwargs_conditionals)
+
+        kwargs_conditionals["pointmap"] = pointmap
+        kwargs_conditionals["pointmap_scale"] = pointmap_scale
+        kwargs_conditionals["pointmap_shift"] = pointmap_shift
+        kwargs_conditionals["ss_decoder"] = ss_decoder
+        
+        return ret

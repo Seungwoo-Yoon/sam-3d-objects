@@ -1,0 +1,78 @@
+import os
+import numpy as np
+
+def save_pc(points, filepath, color=(255, 255, 255, 255)):
+    """Save point cloud to a PLY file.
+
+    Args:
+        points (np.ndarray): Nx3 array of point coordinates.
+        filepath (str): Path to save the PLY file.
+        color (tuple): RGBA color of the points in the PLY file. (default: white)
+    """
+    num_points = points.shape[0]
+
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+    with open(filepath, 'w') as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {num_points}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write(f"property uchar red\n")
+        f.write(f"property uchar green\n")
+        f.write(f"property uchar blue\n")
+        f.write("property uchar alpha\n")
+        f.write("end_header\n")
+        for point in points:
+            f.write(f"{point[0]} {point[1]} {point[2]} {color[0]} {color[1]} {color[2]} {color[3]}\n")
+
+# save multiple point clouds
+def save_multiple_pcs(point_clouds, filepath, colors=None, sample=-1):
+    """Save multiple point clouds to a single PLY file
+
+    Args:
+        point_clouds (list of np.ndarray): List of Nx3 arrays of point coordinates.
+        filepath (str): Path to save the PLY file.
+        colors (list of tuple): List of RGBA colors for each point cloud. If None, all will be white.
+        sample (int): If > 0, randomly sample this many points from each point cloud before saving.
+    """
+    assert isinstance(point_clouds, list), "point_clouds should be a list of numpy arrays"
+    for pc in point_clouds:
+        assert isinstance(pc, np.ndarray), "Each point cloud should be a numpy array"
+        assert pc.ndim == 2, "Each point cloud should be a 2D array"
+        assert pc.shape[1] == 3, "Each point cloud should have shape Nx3"
+
+    if colors is None:
+        colors = [(255, 255, 255, 255)] * len(point_clouds)
+
+    total_points = sum(pc.shape[0] for pc in point_clouds)
+    if sample > 0:
+        new_point_clouds = []
+        for pc in point_clouds:
+            if pc.shape[0] > sample:
+                indices = np.random.choice(pc.shape[0], sample, replace=False)
+                new_point_clouds.append(pc[indices])
+            else:
+                new_point_clouds.append(pc)
+        point_clouds = new_point_clouds
+        total_points = sum(pc.shape[0] for pc in point_clouds)
+
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+    with open(filepath, 'w') as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {total_points}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write(f"property uchar red\n")
+        f.write(f"property uchar green\n")
+        f.write(f"property uchar blue\n")
+        f.write("property uchar alpha\n")
+        f.write("end_header\n")
+        for pc, color in zip(point_clouds, colors):
+            for point in pc:
+                f.write(f"{point[0]} {point[1]} {point[2]} {color[0]} {color[1]} {color[2]} {color[3]}\n")

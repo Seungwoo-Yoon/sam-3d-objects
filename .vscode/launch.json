@@ -1,0 +1,13 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "SAM 3D Objects Test",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/workspace/sam-3d-objects/test.py",
+            "console": "integratedTerminal",
+            "cwd": "/workspace/sam-3d-objects/notebook",
+        }
+    ]
+}
