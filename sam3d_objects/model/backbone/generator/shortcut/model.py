@@ -487,6 +487,8 @@ class ShortCut(FlowMatching):
                 rotation = pred_latent['6drotation_normalized'][i]  # (1, 6) 6D rotation
                 translation = pred_latent['translation'][i] # (1, 3)
 
+                scale = torch.exp(scale)
+
                 scale = scale.mean(dim=-1, keepdim=True).expand_as(scale)
                 R = rotation_6d_to_matrix(rotation)[0]  # (3, 3)
 
