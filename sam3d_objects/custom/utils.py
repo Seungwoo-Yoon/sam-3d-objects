@@ -1,5 +1,8 @@
 import os
 import numpy as np
+import open3d as o3d
+import torch
+from pytorch3d.ops import iterative_closest_point
 
 def save_pc(points, filepath, color=(255, 255, 255, 255)):
     """Save point cloud to a PLY file.
@@ -76,3 +79,63 @@ def save_multiple_pcs(point_clouds, filepath, colors=None, sample=-1):
         for pc, color in zip(point_clouds, colors):
             for point in pc:
                 f.write(f"{point[0]} {point[1]} {point[2]} {color[0]} {color[1]} {color[2]} {color[3]}\n")
+
+def estimate_rigid_transform_ransac_icp(
+    source: torch.Tensor,   # (N,3) or (B,N,3)
+    target: torch.Tensor,   # (M,3) or (B,M,3)
+):
+    """
+    Torch ICP version (PyTorch3D).
+    Fixes Half/AMP crash by running ICP in float32.
+
+    Returns:
+        R: (3,3) or (B,3,3)
+        t: (3,)  or (B,3)
+        s: (B,)
+    """
+
+    # keep original dtype/device to return consistent tensors
+    out_dtype = source.dtype
+    device = source.device
+
+    # ensure batch dimension
+    if source.dim() == 2:
+        source_b = source.unsqueeze(0)
+    else:
+        source_b = source
+    if target.dim() == 2:
+        target_b = target.unsqueeze(0)
+    else:
+        target_b = target
+
+    # ---- critical: run ICP in float32 (or float64) ----
+    source_b_f = source_b.to(dtype=torch.float32)
+    target_b_f = target_b.to(dtype=torch.float32)
+
+    # AMP/autocast can still force fp16 unless disabled
+    # So explicitly disable autocast for this block.
+    with torch.cuda.amp.autocast(enabled=False):
+        icp = iterative_closest_point(
+            source_b_f, target_b_f,
+            max_iterations=200,
+            relative_rmse_thr=1e-6,
+            estimate_scale=True,
+            allow_reflection=False,
+        )
+
+    R = icp.RTs.R  # (B,3,3) float32
+    t = icp.RTs.T  # (B,3)   float32
+    s = icp.RTs.s  # (B,)    float32
+
+    # cast back to original dtype if you really want (optional)
+    # NOTE: keeping R,t, s in float32 is often better numerically.
+    R = R.to(device=device, dtype=out_dtype)
+    t = t.to(device=device, dtype=out_dtype)
+    s = s.to(device=device, dtype=out_dtype)
+
+    if R.shape[0] == 1 and source.dim() == 2 and target.dim() == 2:
+        R = R[0]
+        t = t[0]
+        s = s[0]
+
+    return R, t, s

@@ -6,7 +6,8 @@ import numpy as np
 from functools import partial
 import optree
 import math
-from pytorch3d.transforms import rotation_6d_to_matrix
+from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_rotation_6d
+import open3d as o3d
 
 from sam3d_objects.model.backbone.generator.base import Base
 from sam3d_objects.data.utils import right_broadcasting
@@ -17,6 +18,8 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 import copy
 
 from sam3d_objects.custom.utils import *
+
+obj_count = 0
 
 
 # https://arxiv.org/pdf/2410.12557
@@ -424,6 +427,9 @@ class ShortCut(FlowMatching):
         """Generate samples using shortcut model"""
         x_0 = self._generate_noise(x_shape, x_device)
         t_seq, d = self._prepare_t_and_d()
+        
+        global obj_count
+        obj_count += 1
 
         for x_t, t in self._solver.solve_iter(
             self._generate_dynamics,
@@ -457,8 +463,7 @@ class ShortCut(FlowMatching):
         )
 
         pointmap = kwargs_conditionals.pop("pointmap", None)
-        pointmap_scale = kwargs_conditionals.pop("pointmap_scale", None)
-        pointmap_shift = kwargs_conditionals.pop("pointmap_shift", None)
+        mask = kwargs_conditionals.pop("mask", None)
         ss_decoder = kwargs_conditionals.pop("ss_decoder", None)
         
         if pointmap is None:
@@ -497,28 +502,56 @@ class ShortCut(FlowMatching):
                 ss_pcs.append(ss_pc)
 
             # (M, 3, H, W) -> (M, HW, 3)
-            pointmap_pc = pointmap.permute(0, 2, 3, 1).reshape(pointmap.shape[0], -1, 3)
-
+            #pointmap_pc = pointmap.permute(0, 2, 3, 1).reshape(pointmap.shape[0], -1, 3)
+            
+            pointmap_pc = []
+            for i in range(pointmap.shape[0]):
+                pm = pointmap[i].permute(1, 2, 0).reshape(-1, 3)  # (HW, 3)
+                msk = mask[i].permute(1, 2, 0).reshape(-1)        # (HW,)
+                pm = pm[msk > 0.5]                                # Apply mask
+                pointmap_pc.append(pm)
+            
             # save the first batch's point clouds for debugging
+            global obj_count
             save_multiple_pcs(
                 [
                     ss_pcs[0].cpu().numpy(),
                     pointmap_pc[0].cpu().numpy()
                 ],
-                f"../debug/pc_readout/{t_copy:.4f}.ply",
+                f"../debug/pc_readout/{obj_count}/{t_copy:.4f}.ply",
                 colors=[
                     (255, 0, 0, 255),
                     (0, 255, 0, 255)
                 ]
             )
 
+            # ICP
+            if 0.8 > t_copy > 0.2:
+                for i in range(len(ss_pcs)):
+                    R_icp, t_icp, s_icp = estimate_rigid_transform_ransac_icp(ss_pcs[i], pointmap_pc[i])
+                    R_icp = torch.tensor(R_icp, device=_get_device(x_t), dtype=torch.float32)
+                    t_icp = torch.tensor(t_icp, device=_get_device(x_t), dtype=torch.float32)
+                    s_icp = torch.tensor(s_icp, device=_get_device(x_t), dtype=torch.float32)
+                    s_icp = torch.clamp(s_icp, 0.5, 2.0)
+
+                    rotation = R_icp @ rotation_6d_to_matrix(pred_latent['6drotation_normalized'][i])[0]
+                    translation = s_icp * (pred_latent['translation'][i] @ R_icp.T) + t_icp
+
+                    pred_latent['6drotation_normalized'][i] = matrix_to_rotation_6d(rotation)
+                    pred_latent['translation'][i] = translation
+                    pred_latent['scale'][i] += torch.log(s_icp.unsqueeze(0))
+
+                ret = tree_tensor_map(
+                    lambda x, pred: (pred - x) / (1 - t_copy), x_t, pred_latent
+                )
+            else:
+                ret = self.reverse_fn(x_t, t, *args_conditionals, d=d, **kwargs_conditionals)
             # TODO: measure GPU time until here
             
-            ret = self.reverse_fn(x_t, t, *args_conditionals, d=d, **kwargs_conditionals)
+            
 
         kwargs_conditionals["pointmap"] = pointmap
-        kwargs_conditionals["pointmap_scale"] = pointmap_scale
-        kwargs_conditionals["pointmap_shift"] = pointmap_shift
+        kwargs_conditionals["mask"] = mask
         kwargs_conditionals["ss_decoder"] = ss_decoder
         
         return ret

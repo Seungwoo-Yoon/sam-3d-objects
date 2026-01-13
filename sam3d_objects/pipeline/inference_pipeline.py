@@ -661,9 +661,8 @@ class InferencePipeline:
 
         image = ss_input_dict["image"]
         
-        pointmap = ss_input_dict.get("rgb_pointmap", None)
-        pointmap_scale = ss_input_dict.get("pointmap_scale", None)
-        pointmap_shift = ss_input_dict.get("pointmap_shift", None)
+        pointmap = ss_input_dict.get("pointmap", None)
+        mask = ss_input_dict.get("mask", None)
 
 
         bs = image.shape[0]
@@ -695,8 +694,7 @@ class InferencePipeline:
                     latent_shape_dict,
                     image.device,
                     pointmap=pointmap,
-                    pointmap_scale=pointmap_scale,
-                    pointmap_shift=pointmap_shift,
+                    mask=mask,
                     ss_decoder=ss_decoder,
                     *condition_args,
                     **condition_kwargs,
