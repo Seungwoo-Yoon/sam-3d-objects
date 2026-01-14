@@ -3,8 +3,8 @@ apt-get install gh
 git clone https://github.com/Seungwoo-Yoon/sam-3d-objects.git
 cd sam-3d-objects
 
-conda env create -f environments/default.yml
-conda activate sam3d-objects
+/opt/miniforge3/condabin/conda env create -f environments/default.yml
+/opt/miniforge3/condabin/conda activate sam3d-objects
 
 export PIP_EXTRA_INDEX_URL="https://pypi.ngc.nvidia.com https://download.pytorch.org/whl/cu121"
 pip install -e '.[dev]'
