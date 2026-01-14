@@ -14,27 +14,28 @@ TAG = "hf"
 config_path = f"{PATH}/../checkpoints/{TAG}/pipeline.yaml"
 inference = Inference(config_path, compile=False)
 
-IMAGE_PATH = f"{PATH}/images/segment1/image.jpg"
+IMAGE_PATH = f"{PATH}/images/segment2/image.jpg"
 IMAGE_NAME = os.path.basename(os.path.dirname(IMAGE_PATH))
 
 image = load_image(IMAGE_PATH)
 masks = load_masks(os.path.dirname(IMAGE_PATH), extension=".png")
 
-outputs = [inference(image, mask, seed=42) for mask in masks[1:]]
+outputs = [inference(image, mask, seed=20) for mask in masks]
 
-# for i, output in enumerate(outputs):
-#     pointmap_pc = output["pointmap"].reshape(-1, 3).cpu().numpy()
-#     sam3d_pc = output["voxel"].cpu().numpy()
+if 'voxel' in outputs[0]:
+    for i, output in enumerate(outputs):
+        pointmap_pc = output["pointmap"].reshape(-1, 3).cpu().numpy()
+        sam3d_pc = output["voxel"].cpu().numpy()
 
-#     scale = output["scale"].cpu().numpy()[0, 0]
-#     translation = output["translation"].cpu().numpy()
-#     rotation = rotation_6d_to_matrix(output["6drotation_normalized"][0].cpu()).numpy()[0]
+        scale = output["scale"].cpu().numpy()[0, 0]
+        translation = output["translation"].cpu().numpy()
+        rotation = rotation_6d_to_matrix(output["6drotation_normalized"][0].cpu()).numpy()[0]
 
-#     sam3d_pc = (sam3d_pc * scale) @ rotation.T + translation
+        sam3d_pc = (sam3d_pc * scale) @ rotation.T + translation
 
-#     save_multiple_pcs([sam3d_pc, pointmap_pc],
-#                       f"../debug/pointmap_sam3d_compare/{i}.ply",
-#                       colors=[(255, 0, 0, 255), (0, 255, 0, 255)])
+        save_multiple_pcs([sam3d_pc, pointmap_pc],
+                        f"../debug/pointmap_sam3d_compare/{i}.ply",
+                        colors=[(255, 0, 0, 255), (0, 255, 0, 255)])
 
 scene_gs = make_scene(*outputs)
 

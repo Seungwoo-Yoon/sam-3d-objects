@@ -355,6 +355,8 @@ class InferencePipelinePointMap(InferencePipeline):
                 use_distillation=use_stage1_distillation,
             )
 
+            # Dino Feature
+
             # We could probably use the decoder from the models themselves
             pointmap_scale = ss_input_dict.get("pointmap_scale", None)
             pointmap_shift = ss_input_dict.get("pointmap_shift", None)

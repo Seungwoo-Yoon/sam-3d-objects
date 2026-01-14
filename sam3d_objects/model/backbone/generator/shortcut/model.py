@@ -526,20 +526,22 @@ class ShortCut(FlowMatching):
             )
 
             # ICP
-            if 0.8 > t_copy > 0.2:
+            if t_copy > 0.5:
+            # if False:
                 for i in range(len(ss_pcs)):
-                    R_icp, t_icp, s_icp = estimate_rigid_transform_ransac_icp(ss_pcs[i], pointmap_pc[i])
+                    # R_icp, t_icp, s_icp = estimate_rigid_transform_ransac_icp(ss_pcs[i], pointmap_pc[i])
+                    R_icp, t_icp = estimate_rigid_transform_ransac_icp(pointmap_pc[i], ss_pcs[i])
                     R_icp = torch.tensor(R_icp, device=_get_device(x_t), dtype=torch.float32)
+                    R_icp = R_icp.T  # inverse
+                    
                     t_icp = torch.tensor(t_icp, device=_get_device(x_t), dtype=torch.float32)
-                    s_icp = torch.tensor(s_icp, device=_get_device(x_t), dtype=torch.float32)
-                    s_icp = torch.clamp(s_icp, 0.5, 2.0)
+                    t_icp = - (R_icp @ t_icp.unsqueeze(-1)).squeeze(-1)
 
                     rotation = R_icp @ rotation_6d_to_matrix(pred_latent['6drotation_normalized'][i])[0]
-                    translation = s_icp * (pred_latent['translation'][i] @ R_icp.T) + t_icp
+                    translation = pred_latent['translation'][i] @ R_icp.T + t_icp
 
                     pred_latent['6drotation_normalized'][i] = matrix_to_rotation_6d(rotation)
                     pred_latent['translation'][i] = translation
-                    pred_latent['scale'][i] += torch.log(s_icp.unsqueeze(0))
 
                 ret = tree_tensor_map(
                     lambda x, pred: (pred - x) / (1 - t_copy), x_t, pred_latent

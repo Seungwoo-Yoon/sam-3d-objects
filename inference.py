@@ -110,7 +110,7 @@ class Inference:
             image,
             None,
             seed,
-            stage1_only=True,
+            stage1_only=False,
             with_mesh_postprocess=False,
             with_texture_baking=False,
             with_layout_postprocess=True,

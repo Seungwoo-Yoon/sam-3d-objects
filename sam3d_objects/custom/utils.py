@@ -91,7 +91,6 @@ def estimate_rigid_transform_ransac_icp(
     Returns:
         R: (3,3) or (B,3,3)
         t: (3,)  or (B,3)
-        s: (B,)
     """
 
     # keep original dtype/device to return consistent tensors
@@ -119,23 +118,21 @@ def estimate_rigid_transform_ransac_icp(
             source_b_f, target_b_f,
             max_iterations=200,
             relative_rmse_thr=1e-6,
-            estimate_scale=True,
+            estimate_scale=False,
             allow_reflection=False,
         )
 
     R = icp.RTs.R  # (B,3,3) float32
     t = icp.RTs.T  # (B,3)   float32
-    s = icp.RTs.s  # (B,)    float32
 
     # cast back to original dtype if you really want (optional)
     # NOTE: keeping R,t, s in float32 is often better numerically.
     R = R.to(device=device, dtype=out_dtype)
     t = t.to(device=device, dtype=out_dtype)
-    s = s.to(device=device, dtype=out_dtype)
 
     if R.shape[0] == 1 and source.dim() == 2 and target.dim() == 2:
         R = R[0]
         t = t[0]
-        s = s[0]
 
-    return R, t, s
+    return R, t
+
