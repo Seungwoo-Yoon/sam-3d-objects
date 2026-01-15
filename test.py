@@ -14,7 +14,7 @@ TAG = "hf"
 config_path = f"{PATH}/../checkpoints/{TAG}/pipeline.yaml"
 inference = Inference(config_path, compile=False)
 
-IMAGE_PATH = f"{PATH}/images/segment2/image.jpg"
+IMAGE_PATH = f"{PATH}/images/segment1/image.jpg"
 IMAGE_NAME = os.path.basename(os.path.dirname(IMAGE_PATH))
 
 image = load_image(IMAGE_PATH)
@@ -36,6 +36,9 @@ if 'voxel' in outputs[0]:
         save_multiple_pcs([sam3d_pc, pointmap_pc],
                         f"../debug/pointmap_sam3d_compare/{i}.ply",
                         colors=[(255, 0, 0, 255), (0, 255, 0, 255)])
+
+for i, output in enumerate(outputs):
+    output["gaussian"][0].save_ply(f"{PATH}/gaussians/single/{IMAGE_NAME}_{i}.ply")
 
 scene_gs = make_scene(*outputs)
 
