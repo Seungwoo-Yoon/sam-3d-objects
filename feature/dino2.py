@@ -15,8 +15,8 @@ voxel_path = '../debug/occupancy_grids/segment1_6_occupancy_grid.npy'
 n_images = 150
 batch_size = 16
 
-H = W = 518
-eps = 1e-4
+H = W = 14 * 37
+eps = 1e-3
 
 # ----------------------------
 # Load images
@@ -31,7 +31,7 @@ for i in range(n_images):
 # ----------------------------
 dinov2_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14_reg')
 dinov2_model.eval().cuda()
-n_patch = 518 // 14  # 37
+n_patch = H // 14  # 37
 
 # ----------------------------
 # Load voxel points
@@ -82,8 +82,8 @@ def project_world_to_image(pts_world, extr, intr):
     # grid_sample coords in [-1,1]
     # align_corners=False 기준으로는 (u+0.5)/W*2-1 형태가 더 정확하지만,
     # 여기서는 기존 코드의 스케일과 호환되도록 u/(W-1) 기반으로 갑니다.
-    gx = (u / (W - 1)) * 2 - 1
-    gy = (v / (H - 1)) * 2 - 1
+    gx = (u) * 2 - 1
+    gy = (v) * 2 - 1
     uv_grid = torch.stack([gx, gy], dim=-1)  # (B,N,2)
 
     return u, v, uv_grid, cam_h[..., 2], valid
@@ -101,8 +101,8 @@ def zbuffer_visibility(u, v, depth, valid, H, W, eps=1e-4):
     B, Np = u.shape
 
     # 정수 픽셀 bin (가장 단순: round). 더 보수적으로 하려면 floor 사용 가능.
-    ui = torch.round(u).long()
-    vi = torch.round(v).long()
+    ui = (torch.round(u * (W - 1) / 5) * 5).long()
+    vi = (torch.round(v * (H - 1) / 5) * 5).long()
 
     # bounds clamp (valid 밖은 어차피 걸러짐)
     ui = ui.clamp(0, W - 1)
@@ -193,6 +193,7 @@ for i, (uvg, vis) in enumerate(zip(uvgrid_all, visible_all)):
 
     vis_img = np.zeros((H, W, 3), dtype=np.uint8)
     pts = uv_img[vis]  # visible만 표시
+    
     if pts.numel() > 0:
         vis_img[pts[:, 1].cpu().numpy(), pts[:, 0].cpu().numpy()] = 255
 

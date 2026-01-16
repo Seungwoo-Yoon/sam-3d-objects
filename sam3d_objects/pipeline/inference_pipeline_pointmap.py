@@ -8,9 +8,10 @@ import torchvision
 from loguru import logger
 from PIL import Image
 import open3d as o3d
+import os
 
 from pytorch3d.renderer import look_at_view_transform
-from pytorch3d.transforms import Transform3d
+from pytorch3d.transforms import Transform3d, rotation_6d_to_matrix
 
 from sam3d_objects.model.backbone.dit.embedder.pointmap import PointPatchEmbed
 from sam3d_objects.pipeline.inference_pipeline import InferencePipeline
@@ -22,7 +23,7 @@ from sam3d_objects.data.dataset.tdfy.transforms_3d import (
 )
 from sam3d_objects.pipeline.utils.pointmap import infer_intrinsics_from_pointmap
 from sam3d_objects.pipeline.inference_utils import o3d_plane_estimation, estimate_plane_area, layout_post_optimization
-
+from sam3d_objects.model.backbone.tdfy_dit.utils import render_utils
 
 def camera_to_pytorch3d_camera(device="cpu") -> DecomposedTransform:
     """
@@ -286,6 +287,8 @@ class InferencePipelinePointMap(InferencePipeline):
                 points_tensor.permute(1, 2, 0), device=self.device
             )
             point_map_tensor["intrinsics"] = intrinsics_result["intrinsics"]
+        else:
+            point_map_tensor["intrinsics"] = intrinsics.to(self.device)
 
         return point_map_tensor
 
@@ -355,6 +358,24 @@ class InferencePipelinePointMap(InferencePipeline):
                 use_distillation=use_stage1_distillation,
             )
 
+            rotation_6d = ss_return_dict["6drotation_normalized"]
+            rotation_matrix = rotation_6d_to_matrix(rotation_6d)
+            translation = ss_return_dict["translation"]
+            translation[:, :, 2] += 1
+            extrinsic = torch.eye(4, device=rotation_matrix.device).unsqueeze(0).repeat(rotation_matrix.shape[0], 1, 1)
+            
+            extrinsic[:, :3, :3] = rotation_matrix
+            extrinsic[:, :3, 3] = translation.squeeze(1)
+
+            # extrinsic = extrinsic.inverse()
+            intrinsic = pointmap_dict["intrinsics"]
+
+            # apply scale to intrinsic and extrinsic
+            scale = torch.mean(ss_return_dict["scale"].squeeze(1), dim=1)  # (B,)
+            intrinsic = intrinsic.clone()
+            # intrinsic[:2, :2] = intrinsic[:2, :2] * scale[0, None, None]
+            extrinsic[:, :3, 3] = extrinsic[:, :3, 3] / scale[:, None]
+
             # We could probably use the decoder from the models themselves
             pointmap_scale = ss_input_dict.get("pointmap_scale", None)
             pointmap_shift = ss_input_dict.get("pointmap_shift", None)
@@ -393,6 +414,17 @@ class InferencePipelinePointMap(InferencePipeline):
                 outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color
             )
             glb = outputs.get("glb", None)
+
+            render = render_utils.render_frames(
+                outputs['gaussian'][0],
+                extrinsic,
+                [intrinsic],
+                {"resolution": 1024, "bg_color": (0, 0, 0), "backend": "gsplat"}
+            )['color'][0]
+
+            img = Image.fromarray(render)
+            os.makedirs("../debug/rendering_test", exist_ok=True)
+            img.save(f"../debug/rendering_test/test.png")
 
             try:
                 if (

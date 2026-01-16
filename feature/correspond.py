@@ -48,7 +48,10 @@ for y, x in tqdm(mask_indices):
     # dists = 1 - np.dot(feats_norm, img_feat_norm)  # cosine distance
 
     # feature에서 가장 유사한 feature 찾기 (L2 distance)
-    dists = np.linalg.norm(features - img_feat, axis=1)  # L
+    # dists = np.linalg.norm(features - img_feat[None, :], axis=1)  # L2 distance
+
+    # 더 빠른 방법은 없을까?
+    dists = np.sum((features - img_feat[None, :]) ** 2, axis=1)  # L2 distance
 
     min_idx = np.argmin(dists)
     correspondences.append((indices[min_idx][0], indices[min_idx][1], indices[min_idx][2]))

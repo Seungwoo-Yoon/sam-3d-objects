@@ -13,7 +13,7 @@
             "name": "Feature Test",
             "type": "debugpy",
             "request": "launch",
-            "program": "/workspace/sam-3d-objects/feature/correspond.py",
+            "program": "/workspace/sam-3d-objects/feature/dino2.py",
             "console": "integratedTerminal",
             "cwd": "/workspace/sam-3d-objects/feature",
         }

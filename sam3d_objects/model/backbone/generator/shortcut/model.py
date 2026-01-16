@@ -486,7 +486,7 @@ class ShortCut(FlowMatching):
             
             for i in range(pred_latent['shape'].shape[0]):
                 ss_pc = coords[coords[:, 0] == i][:, 1:].float()
-                ss_pc = ss_pc / 64.0 - 0.5  # normalize to [-1, 1]
+                ss_pc = ss_pc / 64.0 - 0.5  # normalize to [-0.5, 0.5]
                 
                 scale = pred_latent['scale'][i]        # (1, 3)
                 rotation = pred_latent['6drotation_normalized'][i]  # (1, 6) 6D rotation
@@ -526,8 +526,8 @@ class ShortCut(FlowMatching):
             )
 
             # ICP
-            if t_copy > 0.5:
-            # if False:
+            # if t_copy > 0.5:
+            if False:
                 for i in range(len(ss_pcs)):
                     # R_icp, t_icp, s_icp = estimate_rigid_transform_ransac_icp(ss_pcs[i], pointmap_pc[i])
                     R_icp, t_icp = estimate_rigid_transform_ransac_icp(pointmap_pc[i], ss_pcs[i])
