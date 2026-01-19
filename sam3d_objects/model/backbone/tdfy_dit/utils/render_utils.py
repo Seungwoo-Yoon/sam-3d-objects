@@ -118,6 +118,14 @@ def render_frames(
                     255,
                 ).astype(np.uint8)
             )
+            if "depth" not in rets:
+                rets["depth"] = []
+            if "percent_depth" in res:
+                rets["depth"].append(res["percent_depth"].detach().cpu().numpy())
+            elif "depth" in res:
+                rets["depth"].append(res["depth"].detach().cpu().numpy())
+            else:
+                rets["depth"].append(None)
     return rets
 
 

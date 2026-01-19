@@ -1,9 +1,9 @@
+import torch
 import os
 import uuid
 import imageio
 import numpy as np
 from IPython.display import Image as ImageDisplay
-import torch
 from pytorch3d.transforms import rotation_6d_to_matrix
 
 from inference import Inference, ready_gaussian_for_video_rendering, load_image, load_masks, display_image, make_scene, render_video, interactive_visualizer
@@ -14,7 +14,7 @@ TAG = "hf"
 config_path = f"{PATH}/../checkpoints/{TAG}/pipeline.yaml"
 inference = Inference(config_path, compile=False)
 
-IMAGE_PATH = f"{PATH}/images/segment1/image.jpg"
+IMAGE_PATH = f"{PATH}/images/segment2/image.jpg"
 IMAGE_NAME = os.path.basename(os.path.dirname(IMAGE_PATH))
 
 image = load_image(IMAGE_PATH)

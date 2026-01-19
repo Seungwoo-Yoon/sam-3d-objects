@@ -15,3 +15,7 @@ export PIP_FIND_LINKS="https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.
 pip install -e '.[inference]'
 
 ./patching/hydra
+
+mkdir -p /tmp/extensions
+git clone https://github.com/NVlabs/nvdiffrast.git /tmp/extensions/nvdiffrast
+pip install /tmp/extensions/nvdiffrast --no-build-isolation

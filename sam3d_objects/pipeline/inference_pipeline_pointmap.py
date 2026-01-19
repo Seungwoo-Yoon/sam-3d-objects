@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 from typing import Union, Optional
 from copy import deepcopy
+import cv2
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -24,6 +25,11 @@ from sam3d_objects.data.dataset.tdfy.transforms_3d import (
 from sam3d_objects.pipeline.utils.pointmap import infer_intrinsics_from_pointmap
 from sam3d_objects.pipeline.inference_utils import o3d_plane_estimation, estimate_plane_area, layout_post_optimization
 from sam3d_objects.model.backbone.tdfy_dit.utils import render_utils
+
+from romatch import roma_indoor
+from romatch.utils.utils import tensor_to_pil
+import torch.nn.functional as F
+from sam3d_objects.custom.utils import *
 
 def camera_to_pytorch3d_camera(device="cpu") -> DecomposedTransform:
     """
@@ -358,23 +364,6 @@ class InferencePipelinePointMap(InferencePipeline):
                 use_distillation=use_stage1_distillation,
             )
 
-            rotation_6d = ss_return_dict["6drotation_normalized"]
-            rotation_matrix = rotation_6d_to_matrix(rotation_6d)
-            translation = ss_return_dict["translation"]
-            translation[:, :, 2] += 1
-            extrinsic = torch.eye(4, device=rotation_matrix.device).unsqueeze(0).repeat(rotation_matrix.shape[0], 1, 1)
-            
-            extrinsic[:, :3, :3] = rotation_matrix
-            extrinsic[:, :3, 3] = translation.squeeze(1)
-
-            # extrinsic = extrinsic.inverse()
-            intrinsic = pointmap_dict["intrinsics"]
-
-            # apply scale to intrinsic and extrinsic
-            scale = torch.mean(ss_return_dict["scale"].squeeze(1), dim=1)  # (B,)
-            intrinsic = intrinsic.clone()
-            # intrinsic[:2, :2] = intrinsic[:2, :2] * scale[0, None, None]
-            extrinsic[:, :3, 3] = extrinsic[:, :3, 3] / scale[:, None]
 
             # We could probably use the decoder from the models themselves
             pointmap_scale = ss_input_dict.get("pointmap_scale", None)
@@ -386,6 +375,31 @@ class InferencePipelinePointMap(InferencePipeline):
                     scene_shift=pointmap_shift,
                 )
             )
+
+            rotation_6d = ss_return_dict["6drotation_normalized"]
+            rotation_matrix = rotation_6d_to_matrix(rotation_6d)
+            translation = ss_return_dict["translation"]
+            # translation[:, :] -= pointmap_shift / pointmap_scale[:, 2]
+
+            extrinsic = torch.eye(4, device=rotation_matrix.device).unsqueeze(0).repeat(rotation_matrix.shape[0], 1, 1)
+            
+            extrinsic[:, :3, :3] = rotation_matrix
+
+            normalized_pointmap_scale = torch.mean(pointmap_scale.squeeze(1), dim=1)  # (B,)
+
+            # translation *= normalized_pointmap_scale
+            # translation -= pointmap_shift
+            extrinsic[:, :3, 3] = translation.squeeze(1)
+
+            intrinsic = pointmap_dict["intrinsics"]
+
+            # apply scale to intrinsic and extrinsic
+            scale = torch.mean(ss_return_dict["scale"].squeeze(1), dim=1)  # (B,)
+
+            intrinsic = intrinsic.clone()
+            # intrinsic[:2, :2] = intrinsic[:2, :2] * (scale[:, None] * normalized_pointmap_scale[:, None])
+            extrinsic = extrinsic
+            extrinsic[:, :3, 3] = extrinsic[:, :3, 3] / scale[:, None]
 
             logger.info(f"Rescaling scale by {ss_return_dict['downsample_factor']} after downsampling")
             ss_return_dict["scale"] = ss_return_dict["scale"] * ss_return_dict["downsample_factor"]
@@ -419,12 +433,99 @@ class InferencePipelinePointMap(InferencePipeline):
                 outputs['gaussian'][0],
                 extrinsic,
                 [intrinsic],
-                {"resolution": 1024, "bg_color": (0, 0, 0), "backend": "gsplat"}
+                {"resolution": 518, "bg_color": (0, 0, 0), "backend": "gsplat"}
             )['color'][0]
+            
+            depth = render_utils.render_frames(
+                outputs['mesh'][0],
+                extrinsic,
+                [intrinsic],
+                {"resolution": 518, "bg_color": (0, 0, 0), "backend": "gsplat"}
+            )['depth'][0]
 
-            img = Image.fromarray(render)
+            pred_pointmap = unproject_depth_to_pointmap(
+                np.expand_dims(depth, axis=0),
+                np.eye(4)[None, :, :][:, :3, :],
+                intrinsic.unsqueeze(0)
+            )[0]
+
+            depth_img = np.rot90(depth, k=2)
+            # depth_img = (depth_img / np.nanmax(depth_img) * 255).astype(np.uint8) <- 이거 대신 mask에서의 max로 나누기
+            depth_mask = ss_input_dict['rgb_image_mask'][0,0].cpu().numpy()
+            max_depth = np.nanmax(depth_img[depth_mask > 0.5])
+            depth_img = (depth_img / max_depth * 255).astype(np.uint8)
+            depth_img = Image.fromarray(depth_img)
             os.makedirs("../debug/rendering_test", exist_ok=True)
-            img.save(f"../debug/rendering_test/test.png")
+            depth_img.save(f"../debug/rendering_test/test_depth.png")
+
+            img1 = np.rot90(render, k=2)
+            img1 = Image.fromarray(img1)
+            img1.save(f"../debug/rendering_test/test.png")
+
+            img2 = ss_input_dict['rgb_image'][0] * ss_input_dict['rgb_image_mask'][0]
+            img2 = (img2.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            img2 = Image.fromarray(img2)
+            img2.save('../debug/rendering_test/original.png')
+
+            roma_model = roma_indoor(device=self.device)
+            H, W = roma_model.get_output_resolution()
+
+            img1 = img1.resize((W,H))
+            img2 = img2.resize((W,H))
+
+            warp, certainty = roma_model.match(img1, img2, device=self.device)
+            matches, certainty = roma_model.sample(warp, certainty)
+            kpts1, kpts2 = roma_model.to_pixel_coordinates(matches, 518, 518, 518, 518)
+
+            # mask out keypoints outside the mask
+            mask_np = ss_input_dict['rgb_image_mask'][0,0].cpu().numpy()
+
+            img1 = img1.resize((518,518))
+            img2 = img2.resize((518,518))
+
+            valid_kpts = []
+            for i in range(kpts1.shape[0]):
+                x2, y2 = int(kpts2[i,0]), int(kpts2[i,1])
+                if x2 >=0 and x2 < 518 and y2 >=0 and y2 < 518:
+                    if mask_np[y2, x2] > 0.5:
+                        valid_kpts.append(i)
+            kpts1 = kpts1[valid_kpts]
+            kpts2 = kpts2[valid_kpts]
+
+            # visualize keypoints with opencv 
+            # visualize two images side by side with keypoints and lines connecting them
+            # random colors for each keypoint
+            img1_cv = cv2.cvtColor(np.array(img1), cv2.COLOR_RGB2BGR)
+            img2_cv = cv2.cvtColor(np.array(img2), cv2.COLOR_RGB2BGR)
+            vis_img = np.zeros((518, 2*518, 3), dtype=np.uint8)
+            vis_img[:, :518, :] = img1_cv
+            vis_img[:, 518:, :] = img2_cv
+            for i in range(kpts1.shape[0]):
+                color = (int(np.random.randint(0,255)), int(np.random.randint(0,255)), int(np.random.randint(0,255)))
+                pt1 = (int(kpts1[i, 0]), int(kpts1[i, 1]))
+                pt2 = (int(kpts2[i, 0] + 518), int(kpts2[i, 1]))
+                cv2.circle(vis_img, pt1, 3, color, -1)
+                cv2.circle(vis_img, pt2, 3, color, -1)
+                cv2.line(vis_img, pt1, pt2, (255, 0, 0), 1)
+            cv2.imwrite('../debug/rendering_test/matches.png', vis_img)
+
+            gt_keypoint = ss_input_dict['rgb_pointmap'][0].permute(1, 2, 0).cpu().numpy()
+            gt_keypoint = gt_keypoint[kpts2[:,0].long().cpu().numpy(), kpts2[:,1].long().cpu().numpy(), :]
+
+            pred_keypoint = pred_pointmap[kpts1[:,0].long().cpu().numpy(), kpts1[:,1].long().cpu().numpy(), :]
+
+            # point cloud registration using open3d including scaling
+            pcd_gt = o3d.geometry.PointCloud()
+            pcd_gt.points = o3d.utility.Vector3dVector(gt_keypoint)
+            pcd_pred = o3d.geometry.PointCloud()
+            pcd_pred.points = o3d.utility.Vector3dVector(pred_keypoint)
+            threshold = 0.05  # 5cm distance threshold
+
+            reg_p2p = o3d.pipelines.registration.registration_icp(
+                pcd_pred, pcd_gt, threshold, np.eye(4),
+                o3d.pipelines.registration.TransformationEstimationPointToPoint()
+            )
+            print(reg_p2p.transformation)
 
             try:
                 if (
