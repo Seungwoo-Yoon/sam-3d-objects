@@ -458,6 +458,7 @@ class InferencePipelinePointMap(InferencePipeline):
             os.makedirs("../debug/rendering_test", exist_ok=True)
             depth_img.save(f"../debug/rendering_test/test_depth.png")
 
+            '''
             img1 = np.rot90(render, k=2)
             img1 = Image.fromarray(img1)
             img1.save(f"../debug/rendering_test/test.png")
@@ -526,6 +527,7 @@ class InferencePipelinePointMap(InferencePipeline):
                 o3d.pipelines.registration.TransformationEstimationPointToPoint()
             )
             print(reg_p2p.transformation)
+            '''
 
             try:
                 if (

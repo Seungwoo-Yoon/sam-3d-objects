@@ -5,7 +5,7 @@ from sam3d_objects.model.backbone.tdfy_dit.utils import render_utils
 from PIL import Image
 
 num_views = 150
-ply_path = f"../notebook/gaussians/single/segment1_6.ply"
+ply_path = f"../notebook/gaussians/single/segment1_5.ply"
 
 yaws = []
 pitchs = []

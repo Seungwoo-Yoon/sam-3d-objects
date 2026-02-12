@@ -306,6 +306,7 @@ class ShortCut(FlowMatching):
     def loss(self, x1: torch.Tensor, *args_conditionals, **kwargs_conditionals):
         """Compute shortcut model loss with mixed flow matching and self-consistency objectives"""
         # t, d = self._generate_t_and_d(x1)
+        # TODO: use equal samples for t and d across the batch
         t = self._generate_t(x1)
         d = self._generate_d(x1)
         x0 = self._generate_x0(x1)

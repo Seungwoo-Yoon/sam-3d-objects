@@ -1,0 +1,14 @@
+# GSO objects used in FoundationPose dataset
+# Total: 11 objects
+#
+BUNNY_RACER
+Ecoforms_Plant_Saucer_SQ1HARVEST
+FemDophilus
+JarroSil_Activated_Silicon_5exdZHIeLAp
+MK7
+Marc_Anthony_Skip_Professional_Oil_of_Morocco_Conditioner_with_Argan_Oil
+Office_Depot_Canon_CLI_8Y_Ink_Cartridge_Yellow_0623B002
+Tag_Dishtowel_Green
+Threshold_Porcelain_Spoon_Rest_White
+Threshold_Ramekin_White_Porcelain
+adizero_5Tool_25

@@ -3,7 +3,7 @@ from sam3d_objects.model.backbone.tdfy_dit.representations.gaussian.gaussian_mod
 import numpy as np
 import os
 
-ply_path = f"../notebook/gaussians/single/segment1_6.ply"
+ply_path = f"../notebook/gaussians/single/segment1_5.ply"
 
 gs = Gaussian([-1, -1, -1, 2, 2, 2]) # dummy aabb
 gs.load_ply(ply_path)

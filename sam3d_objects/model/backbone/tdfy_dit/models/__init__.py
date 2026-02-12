@@ -4,6 +4,12 @@ from .sparse_structure_flow import SparseStructureFlowModel, SparseStructureFlow
 from .sparse_structure_vae import SparseStructureEncoder, SparseStructureDecoder
 from .structured_latent_vae import SLatGaussianDecoder
 from .structured_latent_flow import SLatFlowModel, SLatFlowModelTdfyWrapper
+from .mot_sparse_structure_flow import SparseStructureFlowTdfyWrapper as MOTSparseStructureFlowTdfyWrapper
+from .global_sparse_structure_flow import (
+    GlobalSparseStructureFlowModel,
+    GlobalSparseStructureFlowTdfyWrapper,
+)
+from .dual_backbone_sparse_structure_flow import DualBackboneSparseStructureFlowTdfyWrapper
 
 def from_pretrained(path: str, **kwargs):
     """

@@ -22,7 +22,8 @@ import numpy as np
 import gradio as gr
 import matplotlib.pyplot as plt
 from copy import deepcopy
-from kaolin.visualize import IpyTurntableVisualizer
+
+
 from kaolin.render.camera import Camera, CameraExtrinsics, PinholeIntrinsics
 import builtins
 from pytorch3d.transforms import quaternion_multiply, quaternion_invert
@@ -350,7 +351,11 @@ def load_image(path):
 
 def load_mask(path):
     mask = load_image(path)
-    mask = mask > 0
+    
+    if mask.shape[-1] == 3 or mask.shape[-1] == 4:
+        mask = mask[..., 0]
+    
+    mask = mask > 0.5
     if mask.ndim == 3:
         mask = mask[..., -1]
     return mask
