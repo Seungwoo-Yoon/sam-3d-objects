@@ -149,7 +149,8 @@ class FlowMatching(Base):
         device = first_tensor.device
 
         t = self.training_time_sampler_fn(
-            size=(batch_size,),
+            # size=(batch_size,),
+            size=(1,),
             generator=self.random_generator,
         ).to(device)
 

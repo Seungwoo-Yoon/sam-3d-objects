@@ -64,7 +64,8 @@ class ShortCut(FlowMatching):
             d: Tensor of step sizes with shape [batch_size]
         """
         first_tensor = optree.tree_flatten(x1)[0][0]
-        batch_size = first_tensor.shape[0]
+        # batch_size = first_tensor.shape[0]
+        batch_size = 1
         device = first_tensor.device
 
         # Use binary-time schedule: d ∈ {1/2^i for i in range(8)}

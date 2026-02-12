@@ -333,7 +333,7 @@ class InferencePipelinePointMap(InferencePipeline):
         with_texture_baking=True,
         with_layout_postprocess=True,
         use_vertex_color=False,
-        stage1_inference_steps=None,
+        stage1_inference_steps=2,
         stage2_inference_steps=None,
         use_stage1_distillation=False,
         use_stage2_distillation=False,

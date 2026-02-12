@@ -1,0 +1,235 @@
+# Training config for DualBackbone ShortCut model with FoundationPose dataset
+#
+# This config is the same architecture as checkpoints/hf/dual_backbone_generator.yaml
+# but with training-specific settings:
+#   - sparse_flow is fully frozen (pretrained primary backbone)
+#   - global_sparse_flow: freeze_shared_parameters=false (trainable)
+#   - use_checkpoint: true (gradient checkpointing to save VRAM)
+#   - condition_embedder freeze: true (keep DINOv2 frozen)
+#
+# Only the global_sparse_flow backbone (8 blocks) is trained.
+#
+# Usage:
+#   python train_dual_backbone_foundationpose.py \
+#       --config configs/train_dual_backbone_foundationpose.yaml \
+#       --data_root /path/to/foundationpose_data
+
+module:
+  condition_embedder:
+    backbone:
+      _target_: sam3d_objects.model.backbone.dit.embedder.embedder_fuser.EmbedderFuser
+      drop_modalities_weight:
+      - - - pointmap
+          - rgb_pointmap
+        - 1.0
+      dropout_prob: 0.1
+      embedder_list:
+      - - _target_: sam3d_objects.model.backbone.dit.embedder.dino.Dino
+          dino_model: dinov2_vitl14_reg
+          input_size: 518
+          normalize_images: true
+        - - - image
+            - cropped
+          - - rgb_image
+            - full
+      - - _target_: sam3d_objects.model.backbone.dit.embedder.dino.Dino
+          dino_model: dinov2_vitl14_reg
+          input_size: 518
+          normalize_images: true
+        - - - mask
+            - cropped
+          - - rgb_image_mask
+            - full
+      - - _target_: sam3d_objects.model.backbone.dit.embedder.pointmap.PointPatchEmbed
+          embed_dim: 1024
+          input_size: 256
+          patch_size: 8
+          remap_output: linear
+        - - - pointmap
+            - cropped
+          - - rgb_pointmap
+            - full
+      force_drop_modalities: null
+      freeze: true  # Keep DINOv2 embedders frozen (pretrained)
+      projection_net_hidden_dim_multiplier: 4.0
+      use_pos_embedding: learned
+  generator:
+    backbone:
+      _target_: sam3d_objects.model.backbone.generator.shortcut.model.ShortCut
+      batch_mode: true
+      cfg_modalities:
+      - shape
+      inference_steps: 2
+      loss_weights:
+        6drotation_normalized: 0.1
+        _target_: sam3d_objects.config.utils.make_dict
+        scale: 0.1
+        shape: 0
+        translation: 1.0
+        translation_scale: 0.0
+      ratio_cfg_samples_in_self_consistency_target: 0.25
+      rescale_t: 1
+      reverse_fn:
+        _target_: sam3d_objects.model.backbone.generator.classifier_free_guidance.ClassifierFreeGuidanceWithExternalUnconditionalProbability
+        backbone:
+          _target_: sam3d_objects.model.backbone.tdfy_dit.models.dual_backbone_sparse_structure_flow.DualBackboneSparseStructureFlowTdfyWrapper
+          # ===== Primary backbone: SparseStructureFlowTdfyWrapper (24 blocks) =====
+          # NOTE: This backbone is fully frozen by the training script.
+          sparse_flow_config:
+            cond_channels: 1024
+            condition_embedder: null  # Will be injected by training script
+            force_zeros_cond: true
+            freeze_shared_parameters: true  # Frozen: pretrained backbone
+            in_channels: 8
+            is_shortcut_model: true
+            latent_mapping:
+              6drotation_normalized:
+                _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.Latent
+                in_channels: 6
+                model_channels: 1024
+                pos_embedder:
+                  _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.LearntPositionEmbedder
+                  model_channels: 1024
+                  token_len: 1
+              scale:
+                _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.Latent
+                in_channels: 3
+                model_channels: 1024
+                pos_embedder:
+                  _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.LearntPositionEmbedder
+                  model_channels: 1024
+                  token_len: 1
+              shape:
+                _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.Latent
+                in_channels: 8
+                model_channels: 1024
+                pos_embedder:
+                  _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.ShapePositionEmbedder
+                  model_channels: 1024
+                  patch_size: 1
+                  resolution: 16
+              translation:
+                _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.Latent
+                in_channels: 3
+                model_channels: 1024
+                pos_embedder:
+                  _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.LearntPositionEmbedder
+                  model_channels: 1024
+                  token_len: 1
+              translation_scale:
+                _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.Latent
+                in_channels: 1
+                model_channels: 1024
+                pos_embedder:
+                  _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.LearntPositionEmbedder
+                  model_channels: 1024
+                  token_len: 1
+            latent_share_transformer:
+              6drotation_normalized:
+              - 6drotation_normalized
+              - translation
+              - scale
+              - translation_scale
+            mlp_ratio: 4
+            model_channels: 1024
+            num_blocks: 24
+            num_heads: 16
+            out_channels: 8
+            patch_size: 1
+            pe_mode: ape
+            qk_rms_norm: true
+            resolution: 16
+            use_checkpoint: true  # TRAINING: gradient checkpointing to save VRAM
+            use_fp16: false
+          # ===== Global backbone: GlobalSparseStructureFlowTdfyWrapper (8 blocks) =====
+          # NOTE: This is the ONLY trainable backbone.
+          global_sparse_flow_config:
+            cond_channels: 1024
+            condition_embedder: null
+            force_zeros_cond: true
+            freeze_shared_parameters: false  # TRAINABLE
+            in_channels: 8
+            is_shortcut_model: true
+            latent_mapping:
+              6drotation_normalized:
+                _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.Latent
+                in_channels: 6
+                model_channels: 1024
+                pos_embedder:
+                  _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.LearntPositionEmbedder
+                  model_channels: 1024
+                  token_len: 1
+              scale:
+                _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.Latent
+                in_channels: 3
+                model_channels: 1024
+                pos_embedder:
+                  _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.LearntPositionEmbedder
+                  model_channels: 1024
+                  token_len: 1
+              shape:
+                _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.Latent
+                in_channels: 8
+                model_channels: 1024
+                pos_embedder:
+                  _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.ShapePositionEmbedder
+                  model_channels: 1024
+                  patch_size: 1
+                  resolution: 16
+              translation:
+                _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.Latent
+                in_channels: 3
+                model_channels: 1024
+                pos_embedder:
+                  _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.LearntPositionEmbedder
+                  model_channels: 1024
+                  token_len: 1
+              translation_scale:
+                _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.Latent
+                in_channels: 1
+                model_channels: 1024
+                pos_embedder:
+                  _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.LearntPositionEmbedder
+                  model_channels: 1024
+                  token_len: 1
+            latent_share_transformer:
+              6drotation_normalized:
+              - 6drotation_normalized
+              - translation
+              - scale
+              - translation_scale
+            mlp_ratio: 4
+            model_channels: 1024
+            num_blocks: 4
+            num_heads: 16
+            out_channels: 8
+            patch_size: 1
+            pe_mode: ape
+            qk_rms_norm: true
+            resolution: 16
+            use_checkpoint: true  # TRAINING: gradient checkpointing to save VRAM
+            use_fp16: false
+          # ===== Checkpoint paths =====
+          # Set paths relative to checkpoint_dir (or absolute paths)
+          # null = initialize from scratch
+          sparse_flow_checkpoint: null
+          global_sparse_flow_checkpoint: null
+          # ===== Combination settings =====
+          combine_mode: add
+          global_flow_weight: 1.0
+        interval:
+        - 0
+        - 500
+        p_unconditional: 0.1
+        strength: 2.0
+        unconditional_handling: add_flag
+      self_consistency_cfg_strength: 2.0
+      self_consistency_prob: 0.25
+      shortcut_loss_weight: 1.0
+      sigma_min: 0.0
+      time_scale: 1000.0
+      training_time_sampler_fn:
+        _partial_: true
+        _target_: sam3d_objects.model.backbone.generator.flow_matching.model.lognorm_sampler
+        mean: -1.0
+        std: 1.0

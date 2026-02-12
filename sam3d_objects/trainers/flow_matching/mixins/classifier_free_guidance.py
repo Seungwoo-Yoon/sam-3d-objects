@@ -52,3 +52,8 @@ class ClassifierFreeGuidanceMixin:
         assert neg_cond is not None, "neg_cond must be provided for classifier-free guidance"
         return {'cond': cond, 'neg_cond': neg_cond, **kwargs}
     
+    # def get_sampler(self, **kwargs) -> samplers.FlowEulerCfgSampler:
+    #     """
+    #     Get the sampler for the diffusion process.
+    #     """
+    #     return samplers.FlowEulerCfgSampler(self.sigma_min)

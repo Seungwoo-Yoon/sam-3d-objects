@@ -38,6 +38,8 @@ class GlobalSparseStructureFlowModel(nn.Module):
         *args,
         **kwargs,
     ):
+        print(f'num_blocks: {num_blocks}')
+
         super().__init__()
         self.in_channels = in_channels
         self.model_channels = model_channels
