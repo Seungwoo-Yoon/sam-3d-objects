@@ -154,6 +154,8 @@ class FlowMatching(Base):
             generator=self.random_generator,
         ).to(device)
 
+        t = t.expand(batch_size)
+
         return t
 
     def loss(self, x1: torch.Tensor, *args_conditionals, **kwargs_conditionals):

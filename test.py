@@ -125,8 +125,6 @@ scene_gs = make_scene(*outputs)
 scene_gs = ready_gaussian_for_video_rendering(scene_gs)
 scene_gs.save_ply(f"{PATH}/gaussians/multi/{IMAGE_NAME}_from_latents.ply")
 
-
-
 video = render_video(
     scene_gs,
     r=1,

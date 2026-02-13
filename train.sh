@@ -3,4 +3,6 @@ export CUDA_VISIBLE_DEVICES=0
 python train_dual_backbone_foundationpose.py \
         --config checkpoints/hf/dual_backbone_generator.yaml \
         --data_root ./foundationpose \
-        --output_dir ./outputs/dual_backbone_fp
+        --output_dir ./outputs/dual_backbone_fp \
+        --precomputed_latents \
+        --gso_root ./gso/google_scanned_objects \

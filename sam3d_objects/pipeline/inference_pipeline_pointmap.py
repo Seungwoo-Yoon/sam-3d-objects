@@ -26,8 +26,8 @@ from sam3d_objects.pipeline.utils.pointmap import infer_intrinsics_from_pointmap
 from sam3d_objects.pipeline.inference_utils import o3d_plane_estimation, estimate_plane_area, layout_post_optimization
 from sam3d_objects.model.backbone.tdfy_dit.utils import render_utils
 
-from romatch import roma_indoor
-from romatch.utils.utils import tensor_to_pil
+#from romatch import roma_indoor
+#from romatch.utils.utils import tensor_to_pil
 import torch.nn.functional as F
 from sam3d_objects.custom.utils import *
 

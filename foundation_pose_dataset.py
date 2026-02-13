@@ -5,16 +5,18 @@ This dataset loads FoundationPose synthetic training data where each scene conta
 multiple objects rendered from Objaverse/GSO. Compatible with the train_shortcut_scene.py script.
 
 FoundationPose Training Dataset Structure:
-- Top-level directories are object IDs (e.g., 696329940/)
+- Top-level directories are object IDs (e.g., 3874429731/)
 - Each object directory contains:
-  - states.json: Object poses and transformations for all objects in scene
-  - scene-xxxxx-xxxx/: Scene directory with renders
-    - RenderProduct_Replicator/: Different camera views
-      - rgb/: RGB images
-      - instance_segmentation/: Segmentation masks and mappings
-      - distance_to_image_plane/: Depth maps (numpy)
-      - camera_params/: Camera parameters (JSON)
-      - bounding_box_2d_loose/: 2D bounding boxes
+  - scene_XXXXXXXX/: Intermediate scene directory
+    - states.json: Object poses and transformations for all objects in scene
+    - scene-xxxxx-xxxx/: Actual scene directory with renders
+      - RenderProduct_Replicator/: Default camera view
+        - rgb/: RGB images
+        - instance_segmentation/: Segmentation masks and mappings
+        - distance_to_image_plane/: Depth maps (numpy)
+        - camera_params/: Camera parameters (JSON)
+        - bounding_box_2d_loose/: 2D bounding boxes
+      - RenderProduct_Replicator_01/: Additional camera views (optional)
 
 GSO Mesh Loading:
 To load GSO mesh data, provide the gso_root parameter pointing to the GSO dataset directory:
@@ -65,6 +67,7 @@ from sam3d_objects.data.utils import tree_tensor_map
 
 
 logger = logging.getLogger(__name__)
+
 
 
 class FoundationPoseDataset(Dataset):
@@ -140,8 +143,9 @@ class FoundationPoseDataset(Dataset):
 
         Returns:
             List of render dictionaries containing:
-            - object_dir: Path to object directory (top-level numbered dir)
-            - scene_dir: Path to scene directory
+            - object_dir: Path to top-level numbered directory
+            - scene_parent_dir: Path to scene_XXXXXXXX directory (contains states.json)
+            - scene_dir: Path to scene-XXX-XXX directory (contains render products)
             - render_dir: Path to specific render product
             - scene_id: Scene identifier
         """
@@ -152,53 +156,62 @@ class FoundationPoseDataset(Dataset):
                             if d.is_dir() and d.name.isdigit()])
 
         for object_dir in object_dirs:
-            # Check if states.json exists
-            states_file = object_dir / 'states.json'
-            if not states_file.exists():
-                continue
+            # Find intermediate scene directories (scene_00000000, scene_00000001, etc.)
+            scene_parent_dirs = sorted([d for d in object_dir.iterdir()
+                                       if d.is_dir() and d.name.startswith('scene_')])
 
-            # Find scene directories
-            scene_dirs = sorted([d for d in object_dir.iterdir()
-                               if d.is_dir() and d.name.startswith('scene-')])
+            for scene_parent_dir in scene_parent_dirs:
+                # Check if states.json exists at this level
+                states_file = scene_parent_dir / 'states.json'
+                if not states_file.exists():
+                    continue
 
-            for scene_dir in scene_dirs:
-                # Find render products (RenderProduct_Replicator, RenderProduct_Replicator_01, etc.)
-                render_dirs = sorted([d for d in scene_dir.iterdir()
-                                    if d.is_dir() and d.name.startswith('RenderProduct_')])
+                # Find actual scene directories (scene-XXX-XXX)
+                scene_dirs = sorted([d for d in scene_parent_dir.iterdir()
+                                   if d.is_dir() and d.name.startswith('scene-')])
 
-                # Limit number of renders per scene
-                render_dirs = render_dirs[:self.num_renders_per_scene]
+                for scene_dir in scene_dirs:
+                    # Find render products (RenderProduct_Replicator, RenderProduct_Replicator_01, etc.)
+                    render_dirs = sorted([d for d in scene_dir.iterdir()
+                                        if d.is_dir() and d.name.startswith('RenderProduct_')])
 
-                for render_dir in render_dirs:
-                    # Check if required data exists
-                    rgb_dir = render_dir / 'rgb'
-                    camera_params_dir = render_dir / 'camera_params'
+                    # Limit number of renders per scene
+                    render_dirs = render_dirs[:self.num_renders_per_scene]
 
-                    if not rgb_dir.exists() or not camera_params_dir.exists():
-                        continue
+                    for render_dir in render_dirs:
+                        # Check if required data exists
+                        rgb_dir = render_dir / 'rgb'
+                        camera_params_dir = render_dir / 'camera_params'
 
-                    scene_id = f"{object_dir.name}_{scene_dir.name}_{render_dir.name}"
+                        if not rgb_dir.exists() or not camera_params_dir.exists():
+                            continue
 
-                    renders.append({
-                        'object_dir': object_dir,
-                        'scene_dir': scene_dir,
-                        'render_dir': render_dir,
-                        'scene_id': scene_id,
-                    })
+                        scene_id = f"{object_dir.name}_{scene_parent_dir.name}_{scene_dir.name}_{render_dir.name}"
+
+                        renders.append({
+                            'object_dir': object_dir,
+                            'scene_parent_dir': scene_parent_dir,
+                            'scene_dir': scene_dir,
+                            'render_dir': render_dir,
+                            'scene_id': scene_id,
+                        })
 
         return renders
 
     def __len__(self) -> int:
         return len(self.scenes)
 
-    def _load_states(self, object_dir: Path) -> Dict[str, Any]:
+    def _load_states(self, scene_parent_dir: Path) -> Dict[str, Any]:
         """
         Load states.json containing object poses and transformations.
+
+        Args:
+            scene_parent_dir: Path to scene_XXXXXXXX directory containing states.json
 
         Returns:
             Dictionary with object information keyed by object UID.
         """
-        states_file = object_dir / 'states.json'
+        states_file = scene_parent_dir / 'states.json'
         with open(states_file, 'r') as f:
             states = json.load(f)
         return states
@@ -409,32 +422,34 @@ class FoundationPoseDataset(Dataset):
 
     def _load_scene_latents(
         self,
-        object_dir: Path,
+        scene_parent_dir: Path,
         states: Dict[str, Any],
         visible_objects: List[str],
+        object_datasets: Dict[str, str],
         camera_view_transform: Optional[np.ndarray] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Load or compute latent representations for all visible objects in the scene.
 
         Args:
-            object_dir: Path to object directory
+            scene_parent_dir: Path to scene_XXXXXXXX directory (contains states.json)
             states: Parsed states.json
             visible_objects: List of object names that are visible in this render
                            (matches keys in states['objects'])
+            object_datasets: Mapping of object_name -> dataset_type (e.g., 'gso', 'objaverse')
             camera_view_transform: 4x4 camera view matrix for converting poses to
                 camera coordinates. If None, poses remain in world coordinates.
 
         Returns:
             Dictionary with keys like:
-            - 'shape': [num_objects, latent_dim]
+            - 'shape': [num_objects, 8, 16, 16, 16]
             - 'translation': [num_objects, 3]
             - 'scale': [num_objects, 3]
             - '6drotation_normalized': [num_objects, 6]
         """
         if self.precomputed_latents:
             # Load pre-computed latents from disk if available
-            latents_file = object_dir / 'latents.pt'
+            latents_file = scene_parent_dir / 'latents.pt'
             if latents_file.exists():
                 all_latents = torch.load(latents_file)
                 # Filter to only visible objects
@@ -473,17 +488,40 @@ class FoundationPoseDataset(Dataset):
         for key in latents_list[0].keys():
             latents[key] = torch.stack([l[key] for l in latents_list], dim=0)
 
-        # Add placeholder shape latents
-        num_objects = len(latents_list)
-        shape_latent_dim = 256  # Adjust based on your model
+        # Load shape latents from precomputed npy files
+        shape_latents = []
 
-        if self.vae_encoder is not None:
-            # TODO: Implement shape encoding using VAE encoder
-            # For now, use random latents
-            latents['shape'] = torch.randn(num_objects, shape_latent_dim)
-        else:
-            # Use zero shape latents as placeholder
-            latents['shape'] = torch.zeros(num_objects, shape_latent_dim)
+        for obj_name in visible_objects:
+            dataset_type = object_datasets.get(obj_name, 'unknown')
+            shape_latent = None
+
+            if dataset_type == 'gso' and self.gso_root is not None:
+                # Load precomputed latent from npy file
+                latent_path = self.gso_root / 'latent_codes' / f'{obj_name}.npy'
+                if latent_path.exists():
+                    try:
+                        # Load latent: shape (1, 8, 16, 16, 16)
+                        loaded_latent = np.load(latent_path)
+                        # Remove batch dimension: (8, 16, 16, 16)
+                        shape_latent = torch.from_numpy(loaded_latent).squeeze(0)
+                        logger.debug(f"Loaded shape latent for {obj_name} from {latent_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to load latent for {obj_name}: {e}")
+                else:
+                    logger.warning(f"Latent file not found for {obj_name}: {latent_path}")
+
+            # Fallback to zero latent if not loaded
+            if shape_latent is None:
+                if self.vae_encoder is not None:
+                    # TODO: Implement shape encoding using VAE encoder
+                    shape_latent = torch.randn(8, 16, 16, 16)
+                else:
+                    shape_latent = torch.zeros(8, 16, 16, 16)
+
+            shape_latents.append(shape_latent)
+
+        # Stack shape latents: [num_objects, 8, 16, 16, 16]
+        latents['shape'] = torch.stack(shape_latents, dim=0)
 
         return latents
 
@@ -688,12 +726,13 @@ class FoundationPoseDataset(Dataset):
         """
         render_info = self.scenes[idx]
         object_dir = render_info['object_dir']
+        scene_parent_dir = render_info['scene_parent_dir']
         scene_dir = render_info['scene_dir']
         render_dir = render_info['render_dir']
         scene_id = render_info['scene_id']
 
         # Load states.json
-        states = self._load_states(object_dir)
+        states = self._load_states(scene_parent_dir)
 
         # Load camera parameters
         camera_params = self._load_camera_params(render_dir, frame_id=0)
@@ -737,7 +776,7 @@ class FoundationPoseDataset(Dataset):
 
         # Load latents for all visible objects (in camera coordinates)
         latents = self._load_scene_latents(
-            object_dir, states, visible_objects,
+            scene_parent_dir, states, visible_objects, object_datasets,
             camera_view_transform=camera_params['camera_view_transform'],
         )
 
@@ -780,9 +819,9 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description='Test FoundationPose dataset with GSO mesh loading')
-    parser.add_argument('--data-root', type=str, default='/workspace/sam-3d-objects/foundationpose',
+    parser.add_argument('--data-root', type=str, default='/workspace/sam-3d-objects/foundationpose/',
                         help='Root directory containing FoundationPose data')
-    parser.add_argument('--gso-root', type=str, default=None,
+    parser.add_argument('--gso-root', type=str, default='/workspace/sam-3d-objects/gso/google_scanned_objects/',
                         help='Root directory containing GSO mesh files')
     parser.add_argument('--load-meshes', action='store_true',
                         help='Load GSO mesh data')
@@ -798,7 +837,7 @@ if __name__ == '__main__':
     dataset = FoundationPoseDataset(
         data_root=data_root,
         max_objects_per_scene=32,
-        precomputed_latents=False,
+        precomputed_latents=True,
         num_renders_per_scene=1,
         gso_root=args.gso_root,
         load_meshes=args.load_meshes,
@@ -812,7 +851,7 @@ if __name__ == '__main__':
 
     if len(dataset) > 0:
         # Load a sample
-        sample = dataset[0]
+        sample = dataset[1]
         print(f"\nSample keys: {sample.keys()}")
         print(f"Scene ID: {sample['scene_id']}")
         print(f"Number of objects: {sample['num_objects']}")

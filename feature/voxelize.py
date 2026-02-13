@@ -3,7 +3,7 @@ from sam3d_objects.model.backbone.tdfy_dit.representations.gaussian.gaussian_mod
 import numpy as np
 import os
 
-ply_path = f"../notebook/gaussians/single/segment1_5.ply"
+ply_path = f"../notebook/gaussians/single/foundationpose_4.ply"
 
 gs = Gaussian([-1, -1, -1, 2, 2, 2]) # dummy aabb
 gs.load_ply(ply_path)
@@ -24,4 +24,4 @@ occupancy_grid[indices[:, 0], indices[:, 1], indices[:, 2]] = 1
 
 # save occupancy grid as .npy file
 os.makedirs("../debug/occupancy_grids", exist_ok=True)
-np.save("../debug/occupancy_grids/segment1_6_occupancy_grid.npy", occupancy_grid)
+np.save("../debug/occupancy_grids/foundationpose_4_occupancy_grid.npy", occupancy_grid)

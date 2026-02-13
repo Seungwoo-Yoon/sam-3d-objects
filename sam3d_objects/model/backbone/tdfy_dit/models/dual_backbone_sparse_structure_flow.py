@@ -125,23 +125,16 @@ class DualBackboneSparseStructureFlowTdfyWrapper(nn.Module):
         Returns:
             Combined output dictionary
         """
-        batch_size = latents_dict['shape'].shape[0]
-
-        t_batch = t.repeat(batch_size)
-
-        d = condition_kwargs.pop("d", None)
-        if d is not None:
-            condition_kwargs["d"] = d.repeat(batch_size)
 
         # Run both models in parallel
         sparse_flow_output = self.sparse_flow(
-            latents_dict, t_batch, *condition_args, **condition_kwargs
+            latents_dict, t, *condition_args, **condition_kwargs
         )
 
-        condition_kwargs["d"] = d
+        d = condition_kwargs.pop("d", None)
 
         global_sparse_flow_output = self.global_sparse_flow(
-            latents_dict, t, *condition_args, **condition_kwargs
+            latents_dict, t[0], d=d[0], *condition_args, **condition_kwargs
         )
 
         # Combine outputs

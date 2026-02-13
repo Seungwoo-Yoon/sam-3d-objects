@@ -53,6 +53,79 @@ from sam3d_objects.data.utils import to_device
 from sam3d_objects.utils.dist_utils import setup_dist, unwrap_dist
 
 
+def setup_logger(logger_type: str, output_dir: Path, config: dict, rank: int = 0):
+    """
+    Setup experiment tracking logger (wandb or tensorboard).
+
+    Args:
+        logger_type: 'wandb', 'tensorboard', or 'none'
+        output_dir: Output directory for logs
+        config: Configuration dict to log
+        rank: Process rank (only rank 0 should log)
+
+    Returns:
+        Logger instance or None
+    """
+    if rank != 0 or logger_type == 'none':
+        return None
+
+    if logger_type == 'wandb':
+        try:
+            import wandb
+            wandb.init(
+                project="sam3d-dual-backbone",
+                name=output_dir.name,
+                config=config,
+                dir=str(output_dir),
+                resume='allow',
+            )
+            logger.info("Initialized Weights & Biases logging")
+            return wandb
+        except ImportError:
+            logger.warning("wandb not installed. Install with: pip install wandb")
+            return None
+
+    elif logger_type == 'tensorboard':
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            log_dir = output_dir / 'tensorboard'
+            log_dir.mkdir(exist_ok=True)
+            writer = SummaryWriter(log_dir=str(log_dir))
+            logger.info(f"Initialized TensorBoard logging at {log_dir}")
+            return writer
+        except ImportError:
+            logger.warning("tensorboard not installed. Install with: pip install tensorboard")
+            return None
+
+    return None
+
+
+def log_metrics(exp_logger, metrics: Dict[str, float], step: int, prefix: str = ""):
+    """
+    Log metrics to the experiment logger.
+
+    Args:
+        exp_logger: wandb or tensorboard writer instance
+        metrics: Dictionary of metrics to log
+        step: Global step number
+        prefix: Optional prefix for metric names
+    """
+    if exp_logger is None:
+        return
+
+    # Wandb
+    if hasattr(exp_logger, 'log'):
+        log_dict = {f"{prefix}{k}" if prefix else k: v for k, v in metrics.items()}
+        log_dict['step'] = step
+        exp_logger.log(log_dict, step=step)
+
+    # TensorBoard
+    elif hasattr(exp_logger, 'add_scalar'):
+        for key, value in metrics.items():
+            tag = f"{prefix}{key}" if prefix else key
+            exp_logger.add_scalar(tag, value, step)
+
+
 def merge_image_and_mask(image: torch.Tensor, mask: torch.Tensor) -> np.ndarray:
     """
     Merge RGB image with mask to create RGBA image.
@@ -381,7 +454,13 @@ def train_epoch(
     use_amp: bool = False,
     scaler: Optional[GradScaler] = None,
     scheduler: Optional[Any] = None,
-) -> Dict[str, float]:
+    exp_logger: Optional[Any] = None,
+    global_step: int = 0,
+    save_interval_steps: int = 0,
+    output_dir: Optional[Path] = None,
+    is_distributed: bool = False,
+    best_loss: float = float('inf'),
+) -> tuple[Dict[str, float], float]:
     """Train for one epoch."""
     model.train()
     embedder = model.condition_embedder
@@ -391,85 +470,147 @@ def train_epoch(
     total_sc_loss = 0.0
     num_scenes = 0
     num_objects = 0
+    current_best_loss = best_loss
 
-    is_distributed = dist.is_initialized()
-    rank = dist.get_rank() if is_distributed else 0
+    is_distributed_runtime = dist.is_initialized()
+    rank = dist.get_rank() if is_distributed_runtime else 0
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=(rank != 0))
 
     for step, batch in enumerate(pbar):
-        latents = to_device(batch['latents'], device)
-        conditionals = to_device(batch['conditionals'], device)
-        scene_num_objects = batch['num_objects']
+        try:
+            latents = to_device(batch['latents'], device)
+            conditionals = to_device(batch['conditionals'], device)
+            scene_num_objects = batch['num_objects']
 
-        optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)
 
-        # Prepare latents: add dummy dimension for token_len=1 modalities
-        latents['scale'] = latents['scale'].unsqueeze(1)
-        latents['6drotation_normalized'] = latents['6drotation_normalized'].unsqueeze(1)
-        latents['translation'] = latents['translation'].unsqueeze(1)
-        latents['translation_scale'] = torch.ones(latents['scale'].shape[0], 1, 1).to(device)
-        latents['shape'] = torch.randn((latents['scale'].shape[0], 16**3, 8)).to(device) # TODO: this is a temporary fix
+            # Prepare latents: add dummy dimension for token_len=1 modalities
+            latents['scale'] = latents['scale'].unsqueeze(1)
+            latents['6drotation_normalized'] = latents['6drotation_normalized'].unsqueeze(1)
+            latents['translation'] = latents['translation'].unsqueeze(1)
+            latents['translation_scale'] = torch.ones(latents['scale'].shape[0], 1, 1).to(device)
+            latents['shape'] = latents['shape'].reshape(-1, 8, 16**3).permute(0, 2, 1).contiguous()
 
-        # Prepare conditioning following Sam3DConditionedMixin pattern
-        image = conditionals['image']  # [H, W, 3]
-        pointmap = conditionals['pointmap']  # [H, W, 3]
-        object_masks = conditionals['object_masks']  # [num_objects, H, W]
+            # Prepare conditioning following Sam3DConditionedMixin pattern
+            image = conditionals['image']  # [H, W, 3]
+            pointmap = conditionals['pointmap']  # [H, W, 3]
+            object_masks = conditionals['object_masks']  # [num_objects, H, W]
 
-        # Preprocess conditioning for all objects in the scene
-        input_dicts = prepare_conditioning_for_scene(
-            image=image,
-            pointmap=pointmap,
-            object_masks=object_masks,
-            preprocessor=preprocessor,
-            device=device,
-        )
+            # Preprocess conditioning for all objects in the scene
+            input_dicts = prepare_conditioning_for_scene(
+                image=image,
+                pointmap=pointmap,
+                object_masks=object_masks,
+                preprocessor=preprocessor,
+                device=device,
+            )
 
-        cond = [get_condition_input(embedder, input_dict, [])[0][0] 
-                for input_dict in input_dicts]
+            cond = [get_condition_input(embedder, input_dict, [])[0][0]
+                    for input_dict in input_dicts]
 
-        cond = torch.concat(cond, dim=0)
+            cond = torch.concat(cond, dim=0)
 
-        if use_amp:
-            with autocast(dtype=torch.float16):
+            if use_amp:
+                with autocast(dtype=torch.float16):
+                    loss, detail_losses = model.loss(latents, cond)
+                scaler.scale(loss).backward()
+                if grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
                 loss, detail_losses = model.loss(latents, cond)
-            scaler.scale(loss).backward()
-            if grad_clip > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            print(latents['scale'].shape)
-            print(cond.shape)
-            loss, detail_losses = model.loss(latents, cond)
-            loss.backward()
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+                loss.backward()
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
 
-        if scheduler is not None:
-            scheduler.step()
+            if scheduler is not None:
+                scheduler.step()
 
-        total_loss += loss.item()
-        total_fm_loss += detail_losses['flow_matching_loss'].item()
-        total_sc_loss += detail_losses['self_consistency_loss'].item()
-        num_scenes += 1
-        num_objects += scene_num_objects
+            total_loss += loss.item()
+            total_fm_loss += detail_losses['flow_matching_loss'].item()
+            total_sc_loss += detail_losses['self_consistency_loss'].item()
+            num_scenes += 1
+            num_objects += scene_num_objects
 
-        if (step + 1) % log_interval == 0:
-            avg_loss = total_loss / num_scenes
-            avg_fm_loss = total_fm_loss / num_scenes
-            avg_sc_loss = total_sc_loss / num_scenes
-            avg_objs = num_objects / num_scenes
+            if (step + 1) % log_interval == 0:
+                avg_loss = total_loss / num_scenes
+                avg_fm_loss = total_fm_loss / num_scenes
+                avg_sc_loss = total_sc_loss / num_scenes
+                avg_objs = num_objects / num_scenes
+                current_lr = optimizer.param_groups[0]["lr"]
 
-            pbar.set_postfix({
-                'loss': f'{avg_loss:.4f}',
-                'fm': f'{avg_fm_loss:.4f}',
-                'sc': f'{avg_sc_loss:.4f}',
-                'objs': f'{avg_objs:.1f}',
-                'lr': f'{optimizer.param_groups[0]["lr"]:.2e}',
-            })
+                pbar.set_postfix({
+                    'loss': f'{avg_loss:.4f}',
+                    'fm': f'{avg_fm_loss:.4f}',
+                    'sc': f'{avg_sc_loss:.4f}',
+                    'objs': f'{avg_objs:.1f}',
+                    'lr': f'{current_lr:.2e}',
+                })
+
+                # Log to experiment tracker
+                if exp_logger is not None and rank == 0:
+                    step_metrics = {
+                        'train/loss': avg_loss,
+                        'train/flow_matching_loss': avg_fm_loss,
+                        'train/self_consistency_loss': avg_sc_loss,
+                        'train/avg_objects_per_scene': avg_objs,
+                        'train/learning_rate': current_lr,
+                        'train/epoch': epoch,
+                    }
+                    log_metrics(exp_logger, step_metrics, global_step + step)
+
+            # Save checkpoint at step intervals
+            current_global_step = global_step + step + 1
+            if save_interval_steps > 0 and current_global_step % save_interval_steps == 0:
+                if rank == 0 and output_dir is not None:
+                    # TODO: UnboundLocalError: cannot access local variable 'avg_loss' where it is not associated with a value
+                    # step_metrics = {
+                    #     'loss': avg_loss,
+                    #     'flow_matching_loss': avg_fm_loss,
+                    #     'self_consistency_loss': avg_sc_loss,
+                    #     'avg_objects_per_scene': avg_objs,
+                    # }
+                    step_metrics = {}
+
+                    # Save periodic checkpoint
+                    save_checkpoint(
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        epoch=epoch,
+                        global_step=current_global_step,
+                        metrics=step_metrics,
+                        save_path=str(output_dir / f'step_{current_global_step:08d}.pt'),
+                        is_distributed=is_distributed,
+                        scaler=scaler,
+                    )
+                    logger.info(f"Saved checkpoint at step {current_global_step}")
+
+                    # Save best checkpoint
+                    # if avg_loss < current_best_loss:
+                    #     current_best_loss = avg_loss
+                    #     save_checkpoint(
+                    #         model=model,
+                    #         optimizer=optimizer,
+                    #         scheduler=scheduler,
+                    #         epoch=epoch,
+                    #         global_step=current_global_step,
+                    #         metrics=step_metrics,
+                    #         save_path=str(output_dir / 'best.pt'),
+                    #         is_distributed=is_distributed,
+                    #         scaler=scaler,
+                    #     )
+                    #     logger.info(f"  New best loss: {current_best_loss:.4f}")
+
+        except Exception as e:
+            logger.error(f"Error in training step {step} (epoch {epoch}): {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            continue
 
     metrics = {
         'loss': total_loss / max(num_scenes, 1),
@@ -478,13 +619,13 @@ def train_epoch(
         'avg_objects_per_scene': num_objects / max(num_scenes, 1),
     }
 
-    if is_distributed:
+    if is_distributed_runtime:
         for key in metrics:
             tensor = torch.tensor(metrics[key], device=device)
             dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
             metrics[key] = tensor.item()
 
-    return metrics
+    return metrics, current_best_loss
 
 
 @torch.no_grad()
@@ -494,9 +635,13 @@ def validate(
     device: torch.device,
     preprocessor: Any,
     use_amp: bool = False,
+    exp_logger: Optional[Any] = None,
+    global_step: int = 0,
+    log_interval: int = 10,
 ) -> Dict[str, float]:
     """Validate the model."""
     model.eval()
+    embedder = model.condition_embedder
 
     total_loss = 0.0
     total_fm_loss = 0.0
@@ -509,40 +654,70 @@ def validate(
 
     pbar = tqdm(dataloader, desc="Validation", disable=(rank != 0))
 
-    for batch in pbar:
-        latents = to_device(batch['latents'], device)
-        conditionals = to_device(batch['conditionals'], device)
-        scene_num_objects = batch['num_objects']
+    for step, batch in enumerate(pbar):
+        try:
+            latents = to_device(batch['latents'], device)
+            conditionals = to_device(batch['conditionals'], device)
+            scene_num_objects = batch['num_objects']
 
-        # Prepare latents
-        latents['scale'] = latents['scale'].unsqueeze(1)
-        latents['6drotation_normalized'] = latents['6drotation_normalized'].unsqueeze(1)
-        latents['translation'] = latents['translation'].unsqueeze(1)
+            # Prepare latents
+            latents['scale'] = latents['scale'].unsqueeze(1)
+            latents['6drotation_normalized'] = latents['6drotation_normalized'].unsqueeze(1)
+            latents['translation'] = latents['translation'].unsqueeze(1)
+            latents['translation_scale'] = torch.ones(latents['scale'].shape[0], 1, 1).to(device)
+            latents['shape'] = latents['shape'].reshape(-1, 8, 16**3).permute(0, 2, 1).contiguous()
 
-        # Prepare conditioning
-        image = conditionals['image']
-        pointmap = conditionals['pointmap']
-        object_masks = conditionals['object_masks']
+            # Prepare conditioning
+            image = conditionals['image']
+            pointmap = conditionals['pointmap']
+            object_masks = conditionals['object_masks']
 
-        cond_kwargs = prepare_conditioning_for_scene(
-            image=image,
-            pointmap=pointmap,
-            object_masks=object_masks,
-            preprocessor=preprocessor,
-            device=device,
-        )
+            # Preprocess conditioning for all objects in the scene
+            input_dicts = prepare_conditioning_for_scene(
+                image=image,
+                pointmap=pointmap,
+                object_masks=object_masks,
+                preprocessor=preprocessor,
+                device=device,
+            )
 
-        if use_amp:
-            with autocast(dtype=torch.float16):
-                loss, detail_losses = model.loss(latents, **cond_kwargs)
-        else:
-            loss, detail_losses = model.loss(latents, **cond_kwargs)
+            cond = [get_condition_input(embedder, input_dict, [])[0][0]
+                    for input_dict in input_dicts]
 
-        total_loss += loss.item()
-        total_fm_loss += detail_losses['flow_matching_loss'].item()
-        total_sc_loss += detail_losses['self_consistency_loss'].item()
-        num_scenes += 1
-        num_objects += scene_num_objects
+            cond = torch.concat(cond, dim=0)
+
+            if use_amp:
+                with autocast(dtype=torch.float16):
+                    loss, detail_losses = model.loss(latents, cond)
+            else:
+                loss, detail_losses = model.loss(latents, cond)
+
+            total_loss += loss.item()
+            total_fm_loss += detail_losses['flow_matching_loss'].item()
+            total_sc_loss += detail_losses['self_consistency_loss'].item()
+            num_scenes += 1
+            num_objects += scene_num_objects
+
+            # Log validation metrics periodically
+            if (step + 1) % log_interval == 0 and exp_logger is not None and rank == 0:
+                avg_loss = total_loss / num_scenes
+                avg_fm_loss = total_fm_loss / num_scenes
+                avg_sc_loss = total_sc_loss / num_scenes
+                avg_objs = num_objects / num_scenes
+
+                val_step_metrics = {
+                    'val/loss': avg_loss,
+                    'val/flow_matching_loss': avg_fm_loss,
+                    'val/self_consistency_loss': avg_sc_loss,
+                    'val/avg_objects_per_scene': avg_objs,
+                }
+                log_metrics(exp_logger, val_step_metrics, global_step + step)
+
+        except Exception as e:
+            logger.error(f"Error in validation step {step}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            continue
 
     metrics = {
         'val_loss': total_loss / max(num_scenes, 1),
@@ -655,6 +830,14 @@ def main(args):
         # Also copy the model config
         shutil.copy2(args.config, output_dir / 'model_config.yaml')
         logger.info(f"Output directory: {output_dir}")
+
+    # --- Setup experiment logger ---
+    exp_logger = setup_logger(
+        logger_type=args.logger,
+        output_dir=output_dir,
+        config=vars(args),
+        rank=rank,
+    )
 
     # --- Build model and preprocessor ---
     logger.info("Building model from config...")
@@ -788,7 +971,7 @@ def main(args):
             train_sampler.set_epoch(epoch)
 
         # Train
-        train_metrics = train_epoch(
+        train_metrics, best_val_loss = train_epoch(
             model=model,
             dataloader=train_loader,
             optimizer=optimizer,
@@ -800,6 +983,12 @@ def main(args):
             use_amp=args.use_amp,
             scaler=scaler,
             scheduler=scheduler,
+            exp_logger=exp_logger,
+            global_step=global_step,
+            save_interval_steps=args.save_interval_steps,
+            output_dir=output_dir,
+            is_distributed=is_distributed,
+            best_loss=best_val_loss,
         )
 
         global_step += len(train_loader)
@@ -813,6 +1002,9 @@ def main(args):
                 device=device,
                 preprocessor=preprocessor,
                 use_amp=args.use_amp,
+                exp_logger=exp_logger,
+                global_step=global_step,
+                log_interval=args.log_interval,
             )
 
         # Log
@@ -827,7 +1019,7 @@ def main(args):
                             f"fm={val_metrics['val_flow_matching_loss']:.4f}, "
                             f"sc={val_metrics['val_self_consistency_loss']:.4f}")
 
-        # Save latest checkpoint
+        # Save latest checkpoint at end of each epoch
         if rank == 0:
             save_checkpoint(
                 model=model,
@@ -841,10 +1033,8 @@ def main(args):
                 scaler=scaler,
             )
 
-        # Save best checkpoint
-        current_loss = val_metrics.get('val_loss', train_metrics['loss'])
-        if current_loss < best_val_loss:
-            best_val_loss = current_loss
+        # Periodic epoch-based checkpoint (if enabled)
+        if args.save_interval_epochs > 0 and (epoch + 1) % args.save_interval_epochs == 0:
             if rank == 0:
                 save_checkpoint(
                     model=model,
@@ -853,27 +1043,19 @@ def main(args):
                     epoch=epoch,
                     global_step=global_step,
                     metrics={**train_metrics, **val_metrics},
-                    save_path=str(output_dir / 'best.pt'),
+                    save_path=str(output_dir / f'epoch_{epoch:04d}.pt'),
                     is_distributed=is_distributed,
                     scaler=scaler,
                 )
-                logger.info(f"  New best loss: {best_val_loss:.4f}")
-
-        # Periodic checkpoint
-        if (epoch + 1) % args.save_interval == 0:
-            save_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch=epoch,
-                global_step=global_step,
-                metrics={**train_metrics, **val_metrics},
-                save_path=str(output_dir / f'epoch_{epoch:04d}.pt'),
-                is_distributed=is_distributed,
-                scaler=scaler,
-            )
 
     logger.info("Training completed!")
+
+    # Finish experiment logging
+    if rank == 0 and exp_logger is not None:
+        if hasattr(exp_logger, 'finish'):
+            exp_logger.finish()
+        elif hasattr(exp_logger, 'close'):
+            exp_logger.close()
 
     if is_distributed:
         dist.destroy_process_group()
@@ -898,7 +1080,7 @@ if __name__ == '__main__':
                         help='Root directory for validation data (optional)')
     parser.add_argument('--gso_root', type=str, default=None,
                         help='Path to GSO dataset root for mesh loading')
-    parser.add_argument('--max_objects_per_scene', type=int, default=32)
+    parser.add_argument('--max_objects_per_scene', type=int, default=12)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--image_width', type=int, default=0,
                         help='Target image width (0 for original)')
@@ -924,9 +1106,14 @@ if __name__ == '__main__':
                         help='Enable find_unused_parameters for DDP')
 
     # Logging & checkpoints
-    parser.add_argument('--log_interval', type=int, default=10)
-    parser.add_argument('--save_interval', type=int, default=5,
-                        help='Checkpoint save interval (epochs)')
+    parser.add_argument('--logger', type=str, default='wandb', choices=['wandb', 'tensorboard', 'none'],
+                        help='Experiment logger to use (default: wandb)')
+    parser.add_argument('--log_interval', type=int, default=10,
+                        help='Step interval for logging metrics')
+    parser.add_argument('--save_interval_steps', type=int, default=1,
+                        help='Checkpoint save interval in steps (0 to disable step-based saving)')
+    parser.add_argument('--save_interval_epochs', type=int, default=0,
+                        help='Checkpoint save interval in epochs (0 to disable epoch-based saving)')
     parser.add_argument('--val_interval', type=int, default=1,
                         help='Validation interval (epochs)')
     parser.add_argument('--output_dir', type=str,

@@ -64,8 +64,7 @@ class ShortCut(FlowMatching):
             d: Tensor of step sizes with shape [batch_size]
         """
         first_tensor = optree.tree_flatten(x1)[0][0]
-        # batch_size = first_tensor.shape[0]
-        batch_size = 1
+        batch_size = first_tensor.shape[0]
         device = first_tensor.device
 
         # Use binary-time schedule: d ∈ {1/2^i for i in range(8)}
@@ -84,7 +83,7 @@ class ShortCut(FlowMatching):
         
         if num_self_consistency_samples > 0:
             # Randomly select d values for self-consistency samples
-            selected_elements = random.choices(base, k=num_self_consistency_samples)
+            selected_elements = random.choices(base, k=1) * num_self_consistency_samples
             d[:num_self_consistency_samples] = torch.FloatTensor(selected_elements).to(device)
         
         # Shuffle the d values to randomize which samples get which d values
