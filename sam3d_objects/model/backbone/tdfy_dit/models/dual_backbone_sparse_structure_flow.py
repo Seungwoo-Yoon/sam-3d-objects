@@ -64,6 +64,8 @@ class DualBackboneSparseStructureFlowTdfyWrapper(nn.Module):
         else:
             logger.info("GlobalSparseStructureFlowTdfyWrapper initialized with default weights (no checkpoint loaded)")
 
+        self.latent_mapping = self.sparse_flow.latent_mapping
+
     def load_sparse_flow_checkpoint(self, checkpoint_path: str, strict: bool = True):
         """
         Load checkpoint for SparseStructureFlowTdfyWrapper.

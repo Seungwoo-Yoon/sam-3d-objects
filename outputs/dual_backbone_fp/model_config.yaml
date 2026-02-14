@@ -25,7 +25,7 @@ module:
           - - rgb_image_mask
             - full
       - - _target_: sam3d_objects.model.backbone.dit.embedder.pointmap.PointPatchEmbed
-          embed_dim: 1024
+          embed_dim: 512
           input_size: 256
           patch_size: 8
           remap_output: linear

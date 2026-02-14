@@ -797,6 +797,66 @@ def load_checkpoint(
     return checkpoint
 
 
+def load_sparse_flow_checkpoint(
+    checkpoint_path: str,
+    model: nn.Module,
+    device: torch.device = torch.device('cpu'),
+):
+    """
+    Load a SparseStructureFlowTdfyWrapper checkpoint into DualBackboneSparseStructureFlowTdfyWrapper.
+
+    This remaps keys from the original single-backbone model to the sparse_flow component
+    of the dual-backbone model, while leaving global_flow initialized from scratch.
+
+    Args:
+        checkpoint_path: Path to the original SparseStructureFlowTdfyWrapper checkpoint
+        model: The DualBackbone model to load into
+        device: Device to load checkpoint onto
+    """
+    logger.info(f"Loading SparseStructureFlow checkpoint from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    # Extract state_dict - handle both raw state_dict and wrapped checkpoint formats
+    if 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    elif 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    else:
+        state_dict = checkpoint
+
+    # Apply prefix filtering (remove "_base_models.generator." prefix)
+    from sam3d_objects.model.io import filter_and_remove_prefix_state_dict_fn
+    state_dict_prefix_func = filter_and_remove_prefix_state_dict_fn("_base_models.generator.")
+    state_dict = state_dict_prefix_func(state_dict)
+
+    # Remap keys to sparse_flow component
+    # Keys like "reverse_fn.backbone.XXX" become "reverse_fn.backbone.sparse_flow.XXX"
+    def add_sparse_flow_prefix(state_dict):
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            new_key = key
+            if key.startswith("reverse_fn.backbone."):
+                new_key = "reverse_fn.backbone.sparse_flow." + key[len("reverse_fn.backbone."):]
+            new_state_dict[new_key] = value
+        return new_state_dict
+
+    state_dict = add_sparse_flow_prefix(state_dict)
+
+    # Load into model
+    raw_model = unwrap_dist(model)
+    missing_keys, unexpected_keys = raw_model.load_state_dict(state_dict, strict=False)
+
+    logger.info(f"Loaded SparseStructureFlow checkpoint")
+    logger.info(f"  Missing keys: {len(missing_keys)} (expected: global_flow params)")
+    logger.info(f"  Unexpected keys: {len(unexpected_keys)}")
+
+    # Log some examples for debugging
+    if missing_keys:
+        logger.info(f"  Example missing keys (first 5): {missing_keys[:5]}")
+    if unexpected_keys:
+        logger.info(f"  Example unexpected keys (first 5): {unexpected_keys[:5]}")
+
+
 def main(args):
     """Main training function."""
 
@@ -946,6 +1006,15 @@ def main(args):
 
     # --- AMP scaler ---
     scaler = GradScaler() if args.use_amp else None
+
+    # --- Initialize from SparseStructureFlow checkpoint ---
+    if args.init_from_sparse_flow_checkpoint:
+        load_sparse_flow_checkpoint(
+            args.init_from_sparse_flow_checkpoint,
+            model,
+            device
+        )
+        logger.info("Initialized sparse_flow from SparseStructureFlow checkpoint")
 
     # --- Resume ---
     start_epoch = 0
@@ -1110,7 +1179,7 @@ if __name__ == '__main__':
                         help='Experiment logger to use (default: wandb)')
     parser.add_argument('--log_interval', type=int, default=10,
                         help='Step interval for logging metrics')
-    parser.add_argument('--save_interval_steps', type=int, default=1,
+    parser.add_argument('--save_interval_steps', type=int, default=100,
                         help='Checkpoint save interval in steps (0 to disable step-based saving)')
     parser.add_argument('--save_interval_epochs', type=int, default=0,
                         help='Checkpoint save interval in epochs (0 to disable epoch-based saving)')
@@ -1122,6 +1191,9 @@ if __name__ == '__main__':
     # Resume
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
+    parser.add_argument('--init_from_sparse_flow_checkpoint', type=str, default=None,
+                        help='Path to SparseStructureFlow checkpoint to initialize sparse_flow from '
+                             '(global_flow will be initialized from scratch)')
 
     args = parser.parse_args()
     main(args)

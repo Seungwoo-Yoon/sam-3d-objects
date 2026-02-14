@@ -6,6 +6,7 @@ import torch
 from loguru import logger
 from functools import wraps
 from torch.utils._pytree import tree_map_only
+from sam3d_objects.model.backbone.tdfy_dit.models.dual_backbone_sparse_structure_flow import DualBackboneSparseStructureFlowTdfyWrapper
 
 
 def set_attention_backend():
@@ -264,6 +265,7 @@ class InferencePipeline:
         self,
         config,
         ckpt_path,
+        strict=True,
         state_dict_fn=None,
         state_dict_key="state_dict",
         device="cuda", 
@@ -280,7 +282,7 @@ class InferencePipeline:
             model = load_model_from_checkpoint(
                 model,
                 ckpt_path,
-                strict=True,
+                strict=strict,
                 device="cpu",
                 freeze=True,
                 eval=True,
@@ -312,11 +314,29 @@ class InferencePipeline:
             "_base_models.generator."
         )
 
+        if (config['reverse_fn']['backbone']['_target_'] == "sam3d_objects.model.backbone.tdfy_dit.models.dual_backbone_sparse_structure_flow.DualBackboneSparseStructureFlowTdfyWrapper"):
+            logger.info("Using DualBackboneSparseStructureFlowTdfyWrapper for ss_generator")
+
+            def add_sparse_flow(state_dict):
+                new_state_dict = {}
+                for key, value in state_dict.items():
+                    new_key = key
+                    if key.startswith("reverse_fn.backbone."):
+                        new_key = "reverse_fn.backbone.sparse_flow." + key[len("reverse_fn.backbone.") :]
+                    new_state_dict[new_key] = value
+                return new_state_dict
+
+            state_dict_func = lambda state_dict: add_sparse_flow(state_dict_prefix_func(state_dict))
+        
+        else:
+            state_dict_func = state_dict_prefix_func
+
         return self.instantiate_and_load_from_pretrained(
             config,
             os.path.join(self.workspace_dir, ss_generator_ckpt_path),
-            state_dict_fn=state_dict_prefix_func,
+            state_dict_fn=state_dict_func,
             device=self.device,
+            strict=False,
         )
 
     def init_slat_generator(self, slat_generator_config_path, slat_generator_ckpt_path):

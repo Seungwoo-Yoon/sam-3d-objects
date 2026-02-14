@@ -16,7 +16,7 @@ TAG = "hf"
 config_path = f"{PATH}/../checkpoints/{TAG}/pipeline.yaml"
 inference = Inference(config_path, compile=False)
 
-IMAGE_PATH = f"{PATH}/images/foundationpose/image.png"
+IMAGE_PATH = f"{PATH}/images/segment1/image.jpg"
 IMAGE_NAME = os.path.basename(os.path.dirname(IMAGE_PATH))
 
 image = load_image(IMAGE_PATH)
@@ -28,7 +28,7 @@ pointmap = torch.from_numpy(pointmap).cuda()
 
 print(pointmap.shape)
 
-outputs = [inference(image, mask, seed=20, pointmap=pointmap) for mask in masks]
+outputs = [inference(image, mask, seed=20) for mask in masks]
 
 if 'voxel' in outputs[0]:
     for i, output in enumerate(outputs):
@@ -108,22 +108,22 @@ scene_gs = ready_gaussian_for_video_rendering(scene_gs)
 # export gaussian splatting (as point cloud)
 scene_gs.save_ply(f"{PATH}/gaussians/multi/{IMAGE_NAME}.ply")
 
-with open('../test_latents.json', 'r') as f:
-    test_latents = json.load(f)
-    scale = test_latents['scale']
-    translation = test_latents['translation']
-    rotation_6d_normalized = test_latents['6drotation_normalized']
+# with open('../test_latents.json', 'r') as f:
+#     test_latents = json.load(f)
+#     scale = test_latents['scale']
+#     translation = test_latents['translation']
+#     rotation_6d_normalized = test_latents['6drotation_normalized']
 
-outputs = outputs_copy
+# outputs = outputs_copy
 
-for i in range(len(outputs)):
-    outputs[i]['scale'] = torch.tensor(scale[i]).unsqueeze(0).cuda() * 2
-    outputs[i]['translation'] = torch.tensor(translation[i]).unsqueeze(0).cuda()
-    outputs[i]['rotation'] = matrix_to_quaternion(rotation_6d_to_matrix(torch.tensor(rotation_6d_normalized[i]).unsqueeze(0).cuda()))
+# for i in range(len(outputs)):
+#     outputs[i]['scale'] = torch.tensor(scale[i]).unsqueeze(0).cuda() * 2
+#     outputs[i]['translation'] = torch.tensor(translation[i]).unsqueeze(0).cuda()
+#     outputs[i]['rotation'] = matrix_to_quaternion(rotation_6d_to_matrix(torch.tensor(rotation_6d_normalized[i]).unsqueeze(0).cuda()))
 
-scene_gs = make_scene(*outputs)
-scene_gs = ready_gaussian_for_video_rendering(scene_gs)
-scene_gs.save_ply(f"{PATH}/gaussians/multi/{IMAGE_NAME}_from_latents.ply")
+# scene_gs = make_scene(*outputs)
+# scene_gs = ready_gaussian_for_video_rendering(scene_gs)
+# scene_gs.save_ply(f"{PATH}/gaussians/multi/{IMAGE_NAME}_from_latents.ply")
 
 video = render_video(
     scene_gs,

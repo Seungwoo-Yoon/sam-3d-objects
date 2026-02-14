@@ -40,8 +40,8 @@ class Latent(nn.Module):
         self.apply(_basic_init)
 
         # Zero-out output layers:
-        # nn.init.constant_(self.out_layer.weight, 0)
-        nn.init.xavier_uniform_(self.out_layer.weight)
+        nn.init.constant_(self.out_layer.weight, 0)
+        # nn.init.xavier_uniform_(self.out_layer.weight)
         nn.init.constant_(self.out_layer.bias, 0)
 
     def to_input(self, x):
