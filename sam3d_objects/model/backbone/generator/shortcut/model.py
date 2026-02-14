@@ -551,8 +551,6 @@ class ShortCut(FlowMatching):
                 ret = self.reverse_fn(x_t, t, *args_conditionals, d=d, **kwargs_conditionals)
             # TODO: measure GPU time until here
             
-            
-
         kwargs_conditionals["pointmap"] = pointmap
         kwargs_conditionals["mask"] = mask
         kwargs_conditionals["ss_decoder"] = ss_decoder

@@ -258,6 +258,12 @@ class InferencePipelinePointMap(InferencePipeline):
                 with torch.autocast(device_type="cuda", dtype=self.dtype):
                     output = self.depth_model(loaded_image)
             pointmaps = output["pointmaps"]
+
+            # save depth and intrinsics for debugging
+            os.makedirs("../debug/pointmap_sam3d_compare", exist_ok=True)
+            np.save("../debug/pointmap_sam3d_compare/depth.npy", output["depth"].cpu().numpy())
+            np.save("../debug/pointmap_sam3d_compare/intrinsics.npy", output["intrinsics"].cpu().numpy())
+
             camera_convention_transform = (
                 Transform3d()
                 .rotate(camera_to_pytorch3d_camera(device=self.device).rotation)

@@ -33,7 +33,7 @@ import logging
 import json
 import shutil
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 import torch
 import torch.nn as nn
@@ -52,6 +52,18 @@ from foundation_pose_dataset import FoundationPoseDataset, collate_fn
 from sam3d_objects.data.utils import to_device
 from sam3d_objects.utils.dist_utils import setup_dist, unwrap_dist
 
+# For visualization validation
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from PIL import Image
+import gc
+from sam3d_objects.model.backbone.tdfy_dit.modules import sparse as sp
+
+from sam3d_objects.pipeline.inference_utils import (
+    SLAT_MEAN,
+    SLAT_STD
+)
 
 def setup_logger(logger_type: str, output_dir: Path, config: dict, rank: int = 0):
     """
@@ -460,10 +472,13 @@ def train_epoch(
     output_dir: Optional[Path] = None,
     is_distributed: bool = False,
     best_loss: float = float('inf'),
+    validation_dirs: Optional[List[str]] = None,
+    val_interval_steps: int = 0,
+    sparse_steps: int = 25,
+    checkpoint_dir: Optional[str] = None,
 ) -> tuple[Dict[str, float], float]:
     """Train for one epoch."""
     model.train()
-    embedder = model.condition_embedder
 
     total_loss = 0.0
     total_fm_loss = 0.0
@@ -505,6 +520,15 @@ def train_epoch(
                 preprocessor=preprocessor,
                 device=device,
             )
+
+            pointmap_scales = [input_dict['pointmap_scale'] for input_dict in input_dicts]
+            pointmap_shifts = [input_dict['pointmap_shift'] for input_dict in input_dicts]
+
+            pointmap_scales = torch.stack(pointmap_scales, dim=0).to(device)
+            pointmap_shifts = torch.stack(pointmap_shifts, dim=0).to(device)
+
+            latents['scale'] = torch.log(latents['scale'] / pointmap_scales)
+            latents['translation'] = (latents['translation'] - pointmap_shifts) / pointmap_scales
 
             cond = [get_condition_input(embedder, input_dict, [])[0][0]
                     for input_dict in input_dicts]
@@ -567,14 +591,12 @@ def train_epoch(
             current_global_step = global_step + step + 1
             if save_interval_steps > 0 and current_global_step % save_interval_steps == 0:
                 if rank == 0 and output_dir is not None:
-                    # TODO: UnboundLocalError: cannot access local variable 'avg_loss' where it is not associated with a value
-                    # step_metrics = {
-                    #     'loss': avg_loss,
-                    #     'flow_matching_loss': avg_fm_loss,
-                    #     'self_consistency_loss': avg_sc_loss,
-                    #     'avg_objects_per_scene': avg_objs,
-                    # }
-                    step_metrics = {}
+                    step_metrics = {
+                        'loss': avg_loss,
+                        'flow_matching_loss': avg_fm_loss,
+                        'self_consistency_loss': avg_sc_loss,
+                        'avg_objects_per_scene': avg_objs,
+                    }
 
                     # Save periodic checkpoint
                     save_checkpoint(
@@ -591,20 +613,38 @@ def train_epoch(
                     logger.info(f"Saved checkpoint at step {current_global_step}")
 
                     # Save best checkpoint
-                    # if avg_loss < current_best_loss:
-                    #     current_best_loss = avg_loss
-                    #     save_checkpoint(
-                    #         model=model,
-                    #         optimizer=optimizer,
-                    #         scheduler=scheduler,
-                    #         epoch=epoch,
-                    #         global_step=current_global_step,
-                    #         metrics=step_metrics,
-                    #         save_path=str(output_dir / 'best.pt'),
-                    #         is_distributed=is_distributed,
-                    #         scaler=scaler,
-                    #     )
-                    #     logger.info(f"  New best loss: {current_best_loss:.4f}")
+                    if avg_loss < current_best_loss:
+                        current_best_loss = avg_loss
+                        save_checkpoint(
+                            model=model,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            epoch=epoch,
+                            global_step=current_global_step,
+                            metrics=step_metrics,
+                            save_path=str(output_dir / 'best.pt'),
+                            is_distributed=is_distributed,
+                            scaler=scaler,
+                        )
+                        logger.info(f"  New best loss: {current_best_loss:.4f}")
+
+            # Run validation with visualization at step intervals
+            if val_interval_steps > 0 and current_global_step % val_interval_steps == 0:
+                if validation_dirs and len(validation_dirs) > 0 and rank == 0 and output_dir is not None:
+                    logger.info(f"Running validation at step {current_global_step}")
+                    validate_with_visualization(
+                        model=model,
+                        validation_dirs=validation_dirs,
+                        device=device,
+                        preprocessor=preprocessor,
+                        checkpoint_dir=checkpoint_dir,
+                        output_dir=output_dir,
+                        global_step=current_global_step,
+                        sparse_steps=sparse_steps,
+                        exp_logger=exp_logger,
+                    )
+                    # Return to train mode
+                    model.train()
 
         except Exception as e:
             logger.error(f"Error in training step {step} (epoch {epoch}): {e}")
@@ -628,111 +668,518 @@ def train_epoch(
     return metrics, current_best_loss
 
 
+def load_validation_case(case_path: Path, device: torch.device) -> Dict[str, Any]:
+    """
+    Load validation case from a folder.
+
+    Args:
+        case_path: Path to folder containing:
+            - image.png or image.jpg
+            - 0.png, 1.png, ... n.png (object masks)
+            - depth.npy
+            - camera_K.npy (3x3 camera intrinsic matrix)
+        device: Target device
+
+    Returns:
+        Dictionary with:
+            - image: [H, W, 3] torch tensor
+            - masks: [num_objects, H, W] torch tensor
+            - depth: [H, W] torch tensor
+            - pointmap: [H, W, 3] torch tensor
+            - camera_K: [3, 3] torch tensor
+    """
+    # Load image
+    image_path = case_path / 'image.png'
+    if not image_path.exists():
+        image_path = case_path / 'image.jpg'
+    if not image_path.exists():
+        raise FileNotFoundError(f"No image.png or image.jpg found in {case_path}")
+
+    image = Image.open(image_path).convert('RGB')
+    image = np.array(image).astype(np.float32) / 255.0  # [H, W, 3]
+    image = torch.from_numpy(image)
+
+    H, W = image.shape[:2]
+
+    # Load masks (0.png, 1.png, ...)
+    mask_files = sorted(case_path.glob('[0-9]*.png'))
+    masks = []
+    for mask_file in mask_files:
+        mask = Image.open(mask_file).convert('L')
+        mask = np.array(mask).astype(np.float32) / 255.0  # [H, W]
+        masks.append(torch.from_numpy(mask))
+
+    if len(masks) == 0:
+        raise FileNotFoundError(f"No object masks found in {case_path}")
+
+    masks = torch.stack(masks, dim=0)  # [num_objects, H, W]
+
+    # Load depth
+    depth_path = case_path / 'depth.npy'
+    if not depth_path.exists():
+        raise FileNotFoundError(f"No depth.npy found in {case_path}")
+
+    depth = np.load(depth_path).astype(np.float32)  # [H, W]
+    depth = torch.from_numpy(depth)
+
+    # Load camera intrinsics
+    camera_K_path = case_path / 'camera_K.npy'
+    if not camera_K_path.exists():
+        raise FileNotFoundError(f"No camera_K.npy found in {case_path}")
+
+    camera_K = np.load(camera_K_path).astype(np.float32)  # [3, 3]
+
+    # Convert depth to pointmap
+    fx = camera_K[0, 0]
+    fy = camera_K[1, 1]
+    cx = camera_K[0, 2]
+    cy = camera_K[1, 2]
+
+    i_coords, j_coords = np.meshgrid(np.arange(W), np.arange(H), indexing='xy')
+    depth_np = depth.numpy()
+    x = (i_coords - cx) * depth_np / fx
+    y = (j_coords - cy) * depth_np / fy
+    z = depth_np
+    pointmap = np.stack([x, y, z], axis=-1).astype(np.float32)  # [H, W, 3]
+
+    # Convert coordinates from OpenGL to PyTorch3D convention
+    pointmap[..., 0] *= -1  # Flip X
+    pointmap[..., 1] *= -1  # Flip Y
+
+    pointmap = torch.from_numpy(pointmap)
+
+    return {
+        'image': image.to(device),
+        'masks': masks.to(device),
+        'depth': depth.to(device),
+        'pointmap': pointmap.to(device),
+        'camera_K': torch.from_numpy(camera_K).to(device),
+    }
+
+
+def load_validation_pipeline_components(checkpoint_dir: str, device: torch.device):
+    """Load slat_generator, slat_decoder, and ss_decoder from checkpoint."""
+    from sam3d_objects.config.utils import locate
+    from sam3d_objects.model.io import filter_and_remove_prefix_state_dict_fn
+
+    # Load slat_generator
+    slat_gen_config = OmegaConf.load(Path(checkpoint_dir) / 'slat_generator.yaml')
+    slat_gen_embedder = instantiate(slat_gen_config.module.condition_embedder.backbone)
+    slat_generator = instantiate(slat_gen_config.module.generator.backbone)
+
+    slat_gen_ckpt = torch.load(Path(checkpoint_dir) / 'slat_generator.ckpt', map_location=device, weights_only=False)['state_dict']
+    state_dict_func = filter_and_remove_prefix_state_dict_fn("_base_models.generator.")
+    slat_generator.load_state_dict(state_dict_func(slat_gen_ckpt), strict=True)
+
+    state_dict_func_embedder = filter_and_remove_prefix_state_dict_fn("_base_models.condition_embedder.")
+    slat_gen_embedder.load_state_dict(state_dict_func_embedder(slat_gen_ckpt), strict=True)
+
+    slat_gen_embedder = slat_gen_embedder.to(device).eval()
+    slat_generator = slat_generator.to(device).eval()
+
+    # Load slat_decoder
+    slat_dec_config = OmegaConf.load(Path(checkpoint_dir) / 'slat_decoder_gs.yaml')
+    slat_decoder = instantiate(slat_dec_config)
+
+    slat_dec_ckpt = torch.load(Path(checkpoint_dir) / 'slat_decoder_gs.ckpt', map_location=device, weights_only=False)
+    slat_decoder.load_state_dict(slat_dec_ckpt, strict=True)
+    slat_decoder = slat_decoder.to(device).eval()
+
+    # Load ss_decoder
+    ss_dec_config = OmegaConf.load(Path(checkpoint_dir) / 'ss_decoder.yaml')
+    ss_decoder = instantiate(ss_dec_config)
+
+    ss_dec_ckpt = torch.load(Path(checkpoint_dir) / 'ss_decoder.ckpt', map_location=device, weights_only=False)
+    ss_decoder.load_state_dict(ss_dec_ckpt, strict=True)
+    ss_decoder = ss_decoder.to(device).eval()
+
+    # Load slat preprocessor from pipeline config
+    pipeline_config = OmegaConf.load(Path(checkpoint_dir) / 'pipeline.yaml')
+    slat_preprocessor = instantiate(pipeline_config.slat_preprocessor)
+
+    return {
+        'slat_generator': slat_generator,
+        'slat_gen_embedder': slat_gen_embedder,
+        'slat_decoder': slat_decoder,
+        'ss_decoder': ss_decoder,
+        'slat_preprocessor': slat_preprocessor,
+    }
+
+
 @torch.no_grad()
-def validate(
+def validate_with_visualization(
     model: nn.Module,
-    dataloader: DataLoader,
+    validation_dirs: List[str],
     device: torch.device,
     preprocessor: Any,
-    use_amp: bool = False,
+    checkpoint_dir: str,
+    output_dir: Path,
+    global_step: int,
+    sparse_steps: int = 25,
     exp_logger: Optional[Any] = None,
-    global_step: int = 0,
-    log_interval: int = 10,
 ) -> Dict[str, float]:
-    """Validate the model."""
-    model.eval()
-    embedder = model.condition_embedder
+    """
+    New validation approach: generate sparse structures and visualize scenes.
 
-    total_loss = 0.0
-    total_fm_loss = 0.0
-    total_sc_loss = 0.0
-    num_scenes = 0
-    num_objects = 0
+    Args:
+        model: The sparse structure generator model (DualBackbone ShortCut)
+        validation_dirs: List of paths to validation case folders
+        device: Target device
+        preprocessor: The preprocessor for conditioning inputs
+        checkpoint_dir: Directory containing model checkpoints
+        output_dir: Directory to save visualizations
+        global_step: Current training step
+        sparse_steps: Number of steps for sparse structure generation (default: 25)
+        exp_logger: Experiment logger (wandb/tensorboard)
+
+    Returns:
+        Empty dict (no loss metrics, only visualizations)
+    """
+    model.eval()
+    model.inference_steps = sparse_steps  # Set the number of steps for inference
+    model.no_shortcut = True
+
+    embedder = model.condition_embedder
 
     is_distributed = dist.is_initialized()
     rank = dist.get_rank() if is_distributed else 0
 
-    pbar = tqdm(dataloader, desc="Validation", disable=(rank != 0))
+    # Only run on rank 0
+    if rank != 0:
+        return {}
 
-    for step, batch in enumerate(pbar):
+    logger.info(f"Running validation with visualization on {len(validation_dirs)} cases")
+
+    # Create output directory
+    vis_dir = output_dir / f'validation_step_{global_step:08d}'
+    vis_dir.mkdir(parents=True, exist_ok=True)
+
+    for case_idx, case_path_str in enumerate(validation_dirs):
+        case_path = Path(case_path_str)
+        if not case_path.exists():
+            logger.warning(f"Validation case not found: {case_path}")
+            continue
+
+        logger.info(f"Processing validation case {case_idx + 1}/{len(validation_dirs)}: {case_path.name}")
+
         try:
-            latents = to_device(batch['latents'], device)
-            conditionals = to_device(batch['conditionals'], device)
-            scene_num_objects = batch['num_objects']
+            # Load case data
+            case_data = load_validation_case(case_path, device)
+            image = case_data['image']
+            masks = case_data['masks']
+            pointmap = case_data['pointmap']
+            num_objects = masks.shape[0]
 
-            # Prepare latents
-            latents['scale'] = latents['scale'].unsqueeze(1)
-            latents['6drotation_normalized'] = latents['6drotation_normalized'].unsqueeze(1)
-            latents['translation'] = latents['translation'].unsqueeze(1)
-            latents['translation_scale'] = torch.ones(latents['scale'].shape[0], 1, 1).to(device)
-            latents['shape'] = latents['shape'].reshape(-1, 8, 16**3).permute(0, 2, 1).contiguous()
-
-            # Prepare conditioning
-            image = conditionals['image']
-            pointmap = conditionals['pointmap']
-            object_masks = conditionals['object_masks']
-
-            # Preprocess conditioning for all objects in the scene
+            # Prepare conditioning for all objects
             input_dicts = prepare_conditioning_for_scene(
                 image=image,
                 pointmap=pointmap,
-                object_masks=object_masks,
+                object_masks=masks,
                 preprocessor=preprocessor,
                 device=device,
             )
 
+            # Embed conditions
             cond = [get_condition_input(embedder, input_dict, [])[0][0]
                     for input_dict in input_dicts]
+            cond = torch.concat(cond, dim=0)  # [num_objects, ...]
 
-            cond = torch.concat(cond, dim=0)
+            # Generate sparse structures for all objects simultaneously
+            logger.info(f"  Generating sparse structures for {num_objects} objects (batch)...")
 
-            if use_amp:
-                with autocast(dtype=torch.float16):
-                    loss, detail_losses = model.loss(latents, cond)
-            else:
-                loss, detail_losses = model.loss(latents, cond)
+            latent_shape_dict = {
+                k: (num_objects,) + (v.pos_emb.shape[0], v.input_layer.in_features)
+                for k, v in model.reverse_fn.backbone.latent_mapping.items()
+            }
 
-            total_loss += loss.item()
-            total_fm_loss += detail_losses['flow_matching_loss'].item()
-            total_sc_loss += detail_losses['self_consistency_loss'].item()
-            num_scenes += 1
-            num_objects += scene_num_objects
+            # Sample sparse structures using trained model (all objects at once)
+            ss_latents = model(
+                latent_shape_dict,
+                device,
+                cond,
+            )
 
-            # Log validation metrics periodically
-            if (step + 1) % log_interval == 0 and exp_logger is not None and rank == 0:
-                avg_loss = total_loss / num_scenes
-                avg_fm_loss = total_fm_loss / num_scenes
-                avg_sc_loss = total_sc_loss / num_scenes
-                avg_objs = num_objects / num_scenes
+            # Load pipeline components temporarily
+            logger.info("  Loading pipeline components...")
+            components = load_validation_pipeline_components(checkpoint_dir, device)
 
-                val_step_metrics = {
-                    'val/loss': avg_loss,
-                    'val/flow_matching_loss': avg_fm_loss,
-                    'val/self_consistency_loss': avg_sc_loss,
-                    'val/avg_objects_per_scene': avg_objs,
+            # Decode sparse structures and generate gaussians for each object
+            logger.info(f"  Generating {num_objects} objects...")
+            outputs = []
+
+            for obj_idx in range(num_objects):
+                logger.info(f"    Object {obj_idx+1}/{num_objects}...")
+
+                # Decode sparse structure for this object
+                ss = components['ss_decoder'](
+                    ss_latents['shape'][obj_idx:obj_idx+1].permute(0, 2, 1).contiguous().view(1, 8, 16, 16, 16)
+                )
+                coords = torch.argwhere(ss > 0)[:, [0, 2, 3, 4]].int()
+
+                if coords.shape[0] == 0:
+                    logger.warning(f"      No sparse structure points generated for object {obj_idx}, skipping...")
+                    continue
+
+                # Prepare slat conditioning
+                rgba_np = merge_image_and_mask(image, masks[obj_idx])
+                rgba_np = (rgba_np * 255).astype(np.uint8)
+
+                slat_input_dict = components['slat_preprocessor']._process_image_mask_pointmap_mess(
+                    torch.from_numpy(rgba_np[:, :, :3].astype(np.float32) / 255.0).permute(2, 0, 1).to(device),
+                    torch.from_numpy((rgba_np[:, :, 3] > 0.5).astype(np.float32)).unsqueeze(0).to(device),
+                    None
+                )
+                slat_input_dict = {
+                    k: v.unsqueeze(0).to(device) if isinstance(v, torch.Tensor) else v
+                    for k, v in slat_input_dict.items()
                 }
-                log_metrics(exp_logger, val_step_metrics, global_step + step)
+
+                # TODO: slat condition input mapping
+                slat_cond = get_condition_input(components['slat_gen_embedder'], slat_input_dict, [])[0][0]
+                slat_cond = (slat_cond, coords.cpu().numpy())
+
+                latent_shape = (1, coords.shape[0], 8)
+
+                # Sample structured latent
+                slat = components['slat_generator'](
+                    latent_shape,
+                    device,
+                    *slat_cond,
+                )
+
+                # Create sparse tensor
+                slat_sparse = sp.SparseTensor(
+                    coords=coords,
+                    feats=slat[0],
+                )
+
+                slat_sparse = slat_sparse * torch.tensor(SLAT_STD).to(device) + torch.tensor(SLAT_MEAN).to(device)
+
+                # Decode to gaussian
+                gaussian = components['slat_decoder'](slat_sparse)
+
+                # Get pose from sparse structure latents
+                from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_quaternion
+
+                pointmap_scale = input_dicts[obj_idx]['pointmap_scale']
+                pointmap_shift = input_dicts[obj_idx]['pointmap_shift']
+
+                scale = torch.exp(ss_latents['scale'][obj_idx:obj_idx+1]) * pointmap_scale
+                translation = ss_latents['translation'][obj_idx:obj_idx+1] * pointmap_scale + pointmap_shift
+                rotation_6d = ss_latents['6drotation_normalized'][obj_idx:obj_idx+1]
+                rotation_matrix = rotation_6d_to_matrix(rotation_6d)
+                rotation_quat = matrix_to_quaternion(rotation_matrix)
+
+                # average scale in -1 dim 
+                scale = scale.mean(dim=-1, keepdim=True).expand_as(scale)
+
+                outputs.append({
+                    'gaussian': gaussian,
+                    'scale': scale.squeeze(1),
+                    'translation': translation.squeeze(1),
+                    'rotation': rotation_quat.squeeze(1),
+                })
+
+            # Free VRAM
+            del components
+            torch.cuda.empty_cache()
+            gc.collect()
+            logger.info("  Pipeline components removed from VRAM")
+
+            # Create scene and render video
+            logger.info("  Creating scene and rendering video...")
+            from inference import make_scene, ready_gaussian_for_video_rendering, render_video
+            import imageio
+
+            scene_gs = make_scene(*outputs)
+            scene_gs = ready_gaussian_for_video_rendering(scene_gs)
+
+            # Render video
+            video = render_video(
+                scene_gs,
+                r=1.5,
+                fov=60,
+                resolution=512,
+                num_frames=120,
+            )["color"]
+
+            # Save results
+            case_vis_dir = vis_dir / f'case_{case_idx:02d}_{case_path.name}'
+            case_vis_dir.mkdir(exist_ok=True)
+
+            # Save video as gif
+            video_path = case_vis_dir / 'scene.gif'
+            imageio.mimsave(
+                str(video_path),
+                video,
+                format="GIF",
+                duration=1000 / 30,
+                loop=0,
+            )
+
+            # Log to wandb/tensorboard (only video)
+            if exp_logger is not None:
+                log_validation_visualizations(
+                    exp_logger=exp_logger,
+                    case_name=case_path.name,
+                    video_path=video_path,
+                    global_step=global_step,
+                )
+
+            logger.info(f"  Saved video to {video_path}")
 
         except Exception as e:
-            logger.error(f"Error in validation step {step}: {e}")
+            logger.error(f"Error processing validation case {case_path}: {e}")
             import traceback
             logger.error(traceback.format_exc())
             continue
 
-    metrics = {
-        'val_loss': total_loss / max(num_scenes, 1),
-        'val_flow_matching_loss': total_fm_loss / max(num_scenes, 1),
-        'val_self_consistency_loss': total_sc_loss / max(num_scenes, 1),
-        'val_avg_objects_per_scene': num_objects / max(num_scenes, 1),
-    }
+    logger.info(f"Validation complete. Results saved to {vis_dir}")
+    return {}
 
-    if is_distributed:
-        for key in metrics:
-            tensor = torch.tensor(metrics[key], device=device)
-            dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
-            metrics[key] = tensor.item()
 
-    return metrics
+def log_validation_visualizations(
+    exp_logger: Any,
+    case_name: str,
+    video_path: Path,
+    global_step: int,
+):
+    """Log validation video to experiment tracker."""
+    if exp_logger is None:
+        return
+
+    if not video_path.exists():
+        return
+
+    # Wandb
+    if hasattr(exp_logger, 'log'):
+        import wandb
+        exp_logger.log({
+            f'validation/{case_name}': wandb.Video(str(video_path), fps=30, format="gif"),
+        }, step=global_step)
+
+    # TensorBoard
+    elif hasattr(exp_logger, 'add_video'):
+        import imageio
+        import torchvision.transforms as T
+
+        # Read gif as video
+        video_frames = imageio.mimread(str(video_path))
+        # Convert to tensor [T, C, H, W]
+        video_tensor = torch.from_numpy(np.stack(video_frames)).permute(0, 3, 1, 2).unsqueeze(0) / 255.0
+        exp_logger.add_video(f'validation/{case_name}', video_tensor, global_step, fps=30)
+
+
+# ============================================================================
+# OLD VALIDATION CODE (DISABLED)
+# This validation function is kept for reference but not used.
+# Use validate_with_visualization() instead for the new validation approach.
+# ============================================================================
+# @torch.no_grad()
+# def validate(
+#     model: nn.Module,
+#     dataloader: DataLoader,
+#     device: torch.device,
+#     preprocessor: Any,
+#     use_amp: bool = False,
+#     exp_logger: Optional[Any] = None,
+#     global_step: int = 0,
+#     log_interval: int = 10,
+# ) -> Dict[str, float]:
+#     """Validate the model."""
+#     model.eval()
+#     embedder = model.condition_embedder
+#
+#     total_loss = 0.0
+#     total_fm_loss = 0.0
+#     total_sc_loss = 0.0
+#     num_scenes = 0
+#     num_objects = 0
+#
+#     is_distributed = dist.is_initialized()
+#     rank = dist.get_rank() if is_distributed else 0
+#
+#     pbar = tqdm(dataloader, desc="Validation", disable=(rank != 0))
+#
+#     for step, batch in enumerate(pbar):
+#         try:
+#             latents = to_device(batch['latents'], device)
+#             conditionals = to_device(batch['conditionals'], device)
+#             scene_num_objects = batch['num_objects']
+#
+#             # Prepare latents
+#             latents['scale'] = latents['scale'].unsqueeze(1)
+#             latents['6drotation_normalized'] = latents['6drotation_normalized'].unsqueeze(1)
+#             latents['translation'] = latents['translation'].unsqueeze(1)
+#             latents['translation_scale'] = torch.ones(latents['scale'].shape[0], 1, 1).to(device)
+#             latents['shape'] = latents['shape'].reshape(-1, 8, 16**3).permute(0, 2, 1).contiguous()
+#
+#             # Prepare conditioning
+#             image = conditionals['image']
+#             pointmap = conditionals['pointmap']
+#             object_masks = conditionals['object_masks']
+#
+#             # Preprocess conditioning for all objects in the scene
+#             input_dicts = prepare_conditioning_for_scene(
+#                 image=image,
+#                 pointmap=pointmap,
+#                 object_masks=object_masks,
+#                 preprocessor=preprocessor,
+#                 device=device,
+#             )
+#
+#             cond = [get_condition_input(embedder, input_dict, [])[0][0]
+#                     for input_dict in input_dicts]
+#
+#             cond = torch.concat(cond, dim=0)
+#
+#             if use_amp:
+#                 with autocast(dtype=torch.float16):
+#                     loss, detail_losses = model.loss(latents, cond)
+#             else:
+#                 loss, detail_losses = model.loss(latents, cond)
+#
+#             total_loss += loss.item()
+#             total_fm_loss += detail_losses['flow_matching_loss'].item()
+#             total_sc_loss += detail_losses['self_consistency_loss'].item()
+#             num_scenes += 1
+#             num_objects += scene_num_objects
+#
+#             # Log validation metrics periodically
+#             if (step + 1) % log_interval == 0 and exp_logger is not None and rank == 0:
+#                 avg_loss = total_loss / num_scenes
+#                 avg_fm_loss = total_fm_loss / num_scenes
+#                 avg_sc_loss = total_sc_loss / num_scenes
+#                 avg_objs = num_objects / num_scenes
+#
+#                 val_step_metrics = {
+#                     'val/loss': avg_loss,
+#                     'val/flow_matching_loss': avg_fm_loss,
+#                     'val/self_consistency_loss': avg_sc_loss,
+#                     'val/avg_objects_per_scene': avg_objs,
+#                 }
+#                 log_metrics(exp_logger, val_step_metrics, global_step + step)
+#
+#         except Exception as e:
+#             logger.error(f"Error in validation step {step}: {e}")
+#             import traceback
+#             logger.error(traceback.format_exc())
+#             continue
+#
+#     metrics = {
+#         'val_loss': total_loss / max(num_scenes, 1),
+#         'val_flow_matching_loss': total_fm_loss / max(num_scenes, 1),
+#         'val_self_consistency_loss': total_sc_loss / max(num_scenes, 1),
+#         'val_avg_objects_per_scene': num_objects / max(num_scenes, 1),
+#     }
+#
+#     if is_distributed:
+#         for key in metrics:
+#             tensor = torch.tensor(metrics[key], device=device)
+#             dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
+#             metrics[key] = tensor.item()
+#
+#     return metrics
 
 
 def save_checkpoint(
@@ -827,7 +1274,7 @@ def load_sparse_flow_checkpoint(
     # Apply prefix filtering (remove "_base_models.generator." prefix)
     from sam3d_objects.model.io import filter_and_remove_prefix_state_dict_fn
     state_dict_prefix_func = filter_and_remove_prefix_state_dict_fn("_base_models.generator.")
-    state_dict = state_dict_prefix_func(state_dict)
+    state_dict_gen = state_dict_prefix_func(state_dict)
 
     # Remap keys to sparse_flow component
     # Keys like "reverse_fn.backbone.XXX" become "reverse_fn.backbone.sparse_flow.XXX"
@@ -840,11 +1287,10 @@ def load_sparse_flow_checkpoint(
             new_state_dict[new_key] = value
         return new_state_dict
 
-    state_dict = add_sparse_flow_prefix(state_dict)
+    state_dict_gen = add_sparse_flow_prefix(state_dict_gen)
 
     # Load into model
-    raw_model = unwrap_dist(model)
-    missing_keys, unexpected_keys = raw_model.load_state_dict(state_dict, strict=False)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict_gen, strict=False)
 
     logger.info(f"Loaded SparseStructureFlow checkpoint")
     logger.info(f"  Missing keys: {len(missing_keys)} (expected: global_flow params)")
@@ -855,6 +1301,13 @@ def load_sparse_flow_checkpoint(
         logger.info(f"  Example missing keys (first 5): {missing_keys[:5]}")
     if unexpected_keys:
         logger.info(f"  Example unexpected keys (first 5): {unexpected_keys[:5]}")
+
+    # load embedder
+    # checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state_dict_prefix_func = filter_and_remove_prefix_state_dict_fn("_base_models.condition_embedder.")
+    embedder_state_dict = state_dict_prefix_func(state_dict)
+    model.condition_embedder.load_state_dict(embedder_state_dict, strict=True)
+
 
 
 def main(args):
@@ -906,6 +1359,15 @@ def main(args):
         checkpoint_dir=args.checkpoint_dir,
     )
     model = model.to(device)
+
+    # --- Initialize from SparseStructureFlow checkpoint ---
+    if args.init_from_sparse_flow_checkpoint:
+        load_sparse_flow_checkpoint(
+            args.init_from_sparse_flow_checkpoint,
+            model,
+            device
+        )
+        logger.info("Initialized sparse_flow from SparseStructureFlow checkpoint")
 
     # Freeze condition embedder (typically pretrained, should not be trained)
     if args.freeze_embedder:
@@ -1007,15 +1469,6 @@ def main(args):
     # --- AMP scaler ---
     scaler = GradScaler() if args.use_amp else None
 
-    # --- Initialize from SparseStructureFlow checkpoint ---
-    if args.init_from_sparse_flow_checkpoint:
-        load_sparse_flow_checkpoint(
-            args.init_from_sparse_flow_checkpoint,
-            model,
-            device
-        )
-        logger.info("Initialized sparse_flow from SparseStructureFlow checkpoint")
-
     # --- Resume ---
     start_epoch = 0
     global_step = 0
@@ -1058,23 +1511,27 @@ def main(args):
             output_dir=output_dir,
             is_distributed=is_distributed,
             best_loss=best_val_loss,
+            validation_dirs=args.validation_dirs,
+            val_interval_steps=args.val_interval_steps if args.val_interval_steps > 0 else args.save_interval_steps,
+            sparse_steps=args.sparse_steps,
+            checkpoint_dir=args.checkpoint_dir if args.checkpoint_dir else os.path.dirname(args.config),
         )
 
         global_step += len(train_loader)
 
-        # Validate
-        val_metrics = {}
-        if val_loader is not None and (epoch + 1) % args.val_interval == 0:
-            val_metrics = validate(
-                model=model,
-                dataloader=val_loader,
-                device=device,
-                preprocessor=preprocessor,
-                use_amp=args.use_amp,
-                exp_logger=exp_logger,
-                global_step=global_step,
-                log_interval=args.log_interval,
-            )
+        # OLD VALIDATION CODE (DISABLED)
+        # val_metrics = {}
+        # if val_loader is not None and (epoch + 1) % args.val_interval == 0:
+        #     val_metrics = validate(
+        #         model=model,
+        #         dataloader=val_loader,
+        #         device=device,
+        #         preprocessor=preprocessor,
+        #         use_amp=args.use_amp,
+        #         exp_logger=exp_logger,
+        #         global_step=global_step,
+        #         log_interval=args.log_interval,
+        #     )
 
         # Log
         if rank == 0:
@@ -1083,10 +1540,6 @@ def main(args):
                         f"fm={train_metrics['flow_matching_loss']:.4f}, "
                         f"sc={train_metrics['self_consistency_loss']:.4f}, "
                         f"objs={train_metrics['avg_objects_per_scene']:.1f}")
-            if val_metrics:
-                logger.info(f"  Val:   loss={val_metrics['val_loss']:.4f}, "
-                            f"fm={val_metrics['val_flow_matching_loss']:.4f}, "
-                            f"sc={val_metrics['val_self_consistency_loss']:.4f}")
 
         # Save latest checkpoint at end of each epoch
         if rank == 0:
@@ -1096,7 +1549,7 @@ def main(args):
                 scheduler=scheduler,
                 epoch=epoch,
                 global_step=global_step,
-                metrics={**train_metrics, **val_metrics},
+                metrics=train_metrics,
                 save_path=str(output_dir / 'latest.pt'),
                 is_distributed=is_distributed,
                 scaler=scaler,
@@ -1111,7 +1564,7 @@ def main(args):
                     scheduler=scheduler,
                     epoch=epoch,
                     global_step=global_step,
-                    metrics={**train_metrics, **val_metrics},
+                    metrics=train_metrics,
                     save_path=str(output_dir / f'epoch_{epoch:04d}.pt'),
                     is_distributed=is_distributed,
                     scaler=scaler,
@@ -1177,16 +1630,24 @@ if __name__ == '__main__':
     # Logging & checkpoints
     parser.add_argument('--logger', type=str, default='wandb', choices=['wandb', 'tensorboard', 'none'],
                         help='Experiment logger to use (default: wandb)')
-    parser.add_argument('--log_interval', type=int, default=10,
+    parser.add_argument('--log_interval', type=int, default=50,
                         help='Step interval for logging metrics')
     parser.add_argument('--save_interval_steps', type=int, default=100,
                         help='Checkpoint save interval in steps (0 to disable step-based saving)')
     parser.add_argument('--save_interval_epochs', type=int, default=0,
                         help='Checkpoint save interval in epochs (0 to disable epoch-based saving)')
-    parser.add_argument('--val_interval', type=int, default=1,
+    parser.add_argument('--val_interval', type=int, default=100,
                         help='Validation interval (epochs)')
     parser.add_argument('--output_dir', type=str,
                         default='./outputs/dual_backbone_foundationpose')
+
+    # Validation with visualization
+    parser.add_argument('--validation_dirs', type=str, nargs='*', default=[],
+                        help='List of directories containing validation cases (image, masks, depth, camera_K)')
+    parser.add_argument('--sparse_steps', type=int, default=25,
+                        help='Number of steps for sparse structure generation during validation')
+    parser.add_argument('--val_interval_steps', type=int, default=1,
+                        help='Validation interval in steps (0 to disable, run at same interval as checkpoint save)')
 
     # Resume
     parser.add_argument('--resume', type=str, default=None,

@@ -133,7 +133,7 @@ class DualBackboneSparseStructureFlowTdfyWrapper(nn.Module):
             latents_dict, t, *condition_args, **condition_kwargs
         )
 
-        d = condition_kwargs.pop("d", None)
+        d = condition_kwargs.pop("d", [None])
 
         global_sparse_flow_output = self.global_sparse_flow(
             latents_dict, t[0], d=d[0], *condition_args, **condition_kwargs
