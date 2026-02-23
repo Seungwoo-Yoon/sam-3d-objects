@@ -35,7 +35,7 @@ from sam3d_objects.model.backbone.tdfy_dit.utils import render_utils
 
 from sam3d_objects.utils.visualization import SceneVisualizer
 
-__all__ = ["Inference"]
+__all__ = ["InferenceJoint"]
 
 WHITELIST_FILTERS = [
     lambda target: target.split(".", 1)[0] in {"sam3d_objects", "torch", "torchvision", "moge"},
@@ -81,7 +81,7 @@ BLACKLIST_FILTERS = [
 ]
 
 
-class Inference:
+class InferenceJoint:
     # public facing inference API
     # only put publicly exposed arguments here
     def __init__(self, config_file: str, compile: bool = False):
@@ -91,7 +91,8 @@ class Inference:
         config.compile_model = compile
         config.workspace_dir = os.path.dirname(config_file)
         check_hydra_safety(config, WHITELIST_FILTERS, BLACKLIST_FILTERS)
-        self._pipeline: InferencePipelinePointMap = instantiate(config)
+        config['_target_'] = "sam3d_objects.pipeline.inference_pipeline_joint.InferencePipelineJoint"
+        self._pipeline: InferencePipelineJoint = instantiate(config)
 
     def merge_mask_to_rgba(self, image, mask):
         mask = mask.astype(np.uint8) * 255
@@ -103,14 +104,14 @@ class Inference:
     def __call__(
         self,
         image: Union[Image.Image, np.ndarray],
-        mask: Optional[Union[None, Image.Image, np.ndarray]],
+        masks: Optional[Union[None, Image.Image, np.ndarray]],
         seed: Optional[int] = None,
         pointmap=None,
     ) -> dict:
-        image = self.merge_mask_to_rgba(image, mask)
+        # image = self.merge_mask_to_rgba(image, mask)
         return self._pipeline.run(
             image,
-            None,
+            masks,
             seed,
             stage1_only=False,
             with_mesh_postprocess=False,

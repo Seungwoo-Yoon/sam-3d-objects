@@ -12,6 +12,7 @@ from typing import Optional, Dict, Any
 import torch
 from loguru import logger
 from pathlib import Path
+from sam3d_objects.model.io import filter_and_remove_prefix_state_dict_fn
 
 def load_pretrained_checkpoint(
     model,
@@ -118,7 +119,8 @@ def load_dual_backbone_from_checkpoints(
             state_dict = checkpoint
 
         # Remove prefix if it exists
-        state_dict = _remove_common_prefix(state_dict)
+        # state_dict = _remove_common_prefix(state_dict)
+        state_dict = filter_and_remove_prefix_state_dict_fn(prefix="reverse_fn.backbone.")(state_dict)
 
         # Load into global_sparse_flow
         missing_keys, unexpected_keys = model.global_sparse_flow.load_state_dict(

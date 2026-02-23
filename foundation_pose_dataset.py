@@ -417,7 +417,7 @@ class FoundationPoseDataset(Dataset):
         return {
             'translation': torch.from_numpy(translation),
             '6drotation_normalized': torch.from_numpy(rotation_6d),
-            'scale': torch.from_numpy(scale),
+            'scale': torch.from_numpy(scale) * 2,
         }
 
     def _load_scene_latents(
@@ -671,6 +671,13 @@ class FoundationPoseDataset(Dataset):
 
             # Add pointmap by backprojecting depth using camera intrinsics
             depth = frame_data['depth'].numpy()  # [H, W]
+
+            # set inf depth values to the max finite depth for backprojection
+            finite_mask = np.isfinite(depth)
+            if np.any(finite_mask):
+                max_finite_depth = np.max(depth[finite_mask])
+                depth[~finite_mask] = max_finite_depth
+
             H, W = depth.shape
             fx = camera_params['camera_K'][0, 0]
             fy = camera_params['camera_K'][1, 1]

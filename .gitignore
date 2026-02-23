@@ -6,3 +6,7 @@ gso/**
 foundationpose/**
 *.pt
 outputs/**
+foundationpose_test/**
+outputs/**
+YCB-V
+YCB-models

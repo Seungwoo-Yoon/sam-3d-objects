@@ -9,26 +9,42 @@ from IPython.display import Image as ImageDisplay
 from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_quaternion, quaternion_to_matrix
 
 from inference import Inference, ready_gaussian_for_video_rendering, load_image, load_masks, display_image, make_scene, render_video, interactive_visualizer
+from inference_joint import InferenceJoint
 from sam3d_objects.custom.utils import *
+from sam3d_objects.model.backbone.tdfy_dit.models.dual_backbone_checkpoint_utils import load_dual_backbone_from_checkpoints
 
 PATH = os.getcwd()
 TAG = "hf"
 config_path = f"{PATH}/../checkpoints/{TAG}/pipeline.yaml"
-inference = Inference(config_path, compile=False)
+inference = InferenceJoint(config_path, compile=False)
 
-IMAGE_PATH = f"{PATH}/images/segment1/image.jpg"
+checkpoint = torch.load(f"{PATH}/../outputs/joint_sam3d_5/step_00005200.pt", map_location='cuda', weights_only=False)
+
+inference._pipeline.models["ss_generator"].reverse_fn.backbone.load_state_dict(
+    checkpoint["model_state_dict"],
+    strict=False
+)
+
+# print(checkpoint["model_state_dict"].keys())
+# random sample 20 keys
+sample_keys = list(checkpoint["model_state_dict"].keys())[:20]
+print("Sample keys from checkpoint:")
+for k in sample_keys:
+    print(k)
+
+IMAGE_PATH = f"{PATH}/images/segment2/image.jpg"
 IMAGE_NAME = os.path.basename(os.path.dirname(IMAGE_PATH))
 
 image = load_image(IMAGE_PATH)
 masks = load_masks(os.path.dirname(IMAGE_PATH), extension=".png")
-print(masks[0])
 
 pointmap = np.load('../test_pointmap.npy')
 pointmap = torch.from_numpy(pointmap).cuda()
 
 print(pointmap.shape)
 
-outputs = [inference(image, mask, seed=20) for mask in masks]
+# outputs = [inference(image, mask, seed=20) for mask in masks]
+outputs = inference(image, masks, seed=20)
 
 if 'voxel' in outputs[0]:
     for i, output in enumerate(outputs):

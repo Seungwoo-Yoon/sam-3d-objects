@@ -195,9 +195,12 @@ class DualBackboneSparseStructureFlowTdfyWrapper(nn.Module):
             else:
                 other_state[k] = v
 
+        print(len(sparse_flow_state), len(global_sparse_flow_state), len(other_state))
+        print(global_sparse_flow_state)
+
         # Load each backbone
-        if sparse_flow_state:
-            self.sparse_flow.load_state_dict(sparse_flow_state, strict=strict)
+        # if sparse_flow_state:
+        #     self.sparse_flow.load_state_dict(sparse_flow_state, strict=strict)
 
         if global_sparse_flow_state:
             self.global_sparse_flow.load_state_dict(global_sparse_flow_state, strict=strict)

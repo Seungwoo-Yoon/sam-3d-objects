@@ -428,6 +428,21 @@ def freeze_sparse_flow(model: nn.Module):
         count += param.numel()
     logger.info(f"Frozen sparse_flow backbone: {count:,} parameters")
 
+def activate_global_sparse_flow(model: nn.Module):
+    """
+    Ensure the global_sparse_flow backbone is active (trainable).
+    This is important if it was accidentally frozen or if we want to explicitly log its parameters.
+    """
+    backbone = model.reverse_fn.backbone  # DualBackbone
+    count = 0
+    for param in backbone.global_sparse_flow.parameters():
+        if not param.requires_grad:
+            print(param)
+
+        param.requires_grad = True
+        count += param.numel()
+
+    logger.info(f"Activated global_sparse_flow backbone: {count:,} parameters set to trainable")
 
 def get_parameter_groups(model: nn.Module, lr: float, weight_decay: float):
     """
@@ -479,6 +494,7 @@ def train_epoch(
 ) -> tuple[Dict[str, float], float]:
     """Train for one epoch."""
     model.train()
+    embedder = model.condition_embedder
 
     total_loss = 0.0
     total_fm_loss = 0.0
@@ -546,6 +562,16 @@ def train_epoch(
                 scaler.update()
             else:
                 loss, detail_losses = model.loss(latents, cond)
+
+                # if loss is NaN or inf, skip the backward step and log a warning
+                if torch.isnan(loss) or torch.isinf(loss):
+                    logger.warning(f"NaN or Inf loss at step {step} (epoch {epoch}), skipping backward step")
+
+                    if scheduler is not None:
+                        scheduler.step()
+
+                    raise ValueError("NaN or Inf loss encountered")
+
                 loss.backward()
                 if grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -559,7 +585,13 @@ def train_epoch(
             total_sc_loss += detail_losses['self_consistency_loss'].item()
             num_scenes += 1
             num_objects += scene_num_objects
+        
+        except Exception as e:
+            logger.error(f"Error in training step {step} (epoch {epoch}): {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
+        try:
             if (step + 1) % log_interval == 0:
                 avg_loss = total_loss / num_scenes
                 avg_fm_loss = total_fm_loss / num_scenes
@@ -645,12 +677,11 @@ def train_epoch(
                     )
                     # Return to train mode
                     model.train()
-
         except Exception as e:
-            logger.error(f"Error in training step {step} (epoch {epoch}): {e}")
+            logger.error(f"Error during logging/checkpointing/validation at step {step} (epoch {epoch}): {e}")
             import traceback
             logger.error(traceback.format_exc())
-            continue
+            model.train()  # Ensure we return to train mode after validation error
 
     metrics = {
         'loss': total_loss / max(num_scenes, 1),
@@ -1202,7 +1233,7 @@ def save_checkpoint(
     checkpoint = {
         'epoch': epoch,
         'global_step': global_step,
-        'model_state_dict': raw_model.state_dict(),
+        'model_state_dict': raw_model.reverse_fn.backbone.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'metrics': metrics,
     }
@@ -1375,6 +1406,9 @@ def main(args):
 
     # Freeze sparse_flow backbone — only train global_sparse_flow
     freeze_sparse_flow(model)
+
+    # Activate global_sparse_flow
+    activate_global_sparse_flow(model)
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
@@ -1602,7 +1636,7 @@ if __name__ == '__main__':
                         help='Root directory for validation data (optional)')
     parser.add_argument('--gso_root', type=str, default=None,
                         help='Path to GSO dataset root for mesh loading')
-    parser.add_argument('--max_objects_per_scene', type=int, default=12)
+    parser.add_argument('--max_objects_per_scene', type=int, default=32)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--image_width', type=int, default=0,
                         help='Target image width (0 for original)')
@@ -1617,7 +1651,7 @@ if __name__ == '__main__':
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--grad_clip', type=float, default=1.0)
-    parser.add_argument('--warmup_ratio', type=float, default=0.05,
+    parser.add_argument('--warmup_ratio', type=float, default=0.0,
                         help='Fraction of total steps for LR warmup')
     parser.add_argument('--use_amp', action='store_true',
                         help='Use automatic mixed precision')
@@ -1630,13 +1664,13 @@ if __name__ == '__main__':
     # Logging & checkpoints
     parser.add_argument('--logger', type=str, default='wandb', choices=['wandb', 'tensorboard', 'none'],
                         help='Experiment logger to use (default: wandb)')
-    parser.add_argument('--log_interval', type=int, default=50,
+    parser.add_argument('--log_interval', type=int, default=1,
                         help='Step interval for logging metrics')
-    parser.add_argument('--save_interval_steps', type=int, default=100,
+    parser.add_argument('--save_interval_steps', type=int, default=10,
                         help='Checkpoint save interval in steps (0 to disable step-based saving)')
     parser.add_argument('--save_interval_epochs', type=int, default=0,
                         help='Checkpoint save interval in epochs (0 to disable epoch-based saving)')
-    parser.add_argument('--val_interval', type=int, default=100,
+    parser.add_argument('--val_interval', type=int, default=50,
                         help='Validation interval (epochs)')
     parser.add_argument('--output_dir', type=str,
                         default='./outputs/dual_backbone_foundationpose')

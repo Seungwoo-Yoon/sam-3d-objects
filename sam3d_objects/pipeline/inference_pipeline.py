@@ -679,6 +679,8 @@ class InferencePipeline:
         if inference_steps:
             ss_generator.inference_steps = inference_steps
 
+        print(ss_input_dict)
+
         image = ss_input_dict["image"]
         
         pointmap = ss_input_dict.get("pointmap", None)
