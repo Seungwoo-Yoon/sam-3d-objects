@@ -35,7 +35,8 @@ class InferencePipelineJoint(InferencePipelinePointMap):
         ss_generator = self.models["ss_generator"]
         ss_decoder = self.models["ss_decoder"]
 
-        
+        ss_generator.inference_steps = stage1_inference_steps if stage1_inference_steps is not None else ss_generator.inference_steps
+        ss_generator.use_distillation = use_stage1_distillation
 
         images = [self.merge_image_and_mask(image, mask) for mask in masks]
 
@@ -88,6 +89,7 @@ class InferencePipelineJoint(InferencePipelinePointMap):
                 # We could probably use the decoder from the models themselves
                 pointmap_scale = ss_input_dict.get("pointmap_scale", None)
                 pointmap_shift = ss_input_dict.get("pointmap_shift", None)
+                print(ss_return_dict.keys())
                 ss_return_dict.update(
                     self.pose_decoder(
                         ss_return_dict,

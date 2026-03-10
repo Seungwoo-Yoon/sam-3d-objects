@@ -9,6 +9,10 @@ from .global_sparse_structure_flow import (
     GlobalSparseStructureFlowModel,
     GlobalSparseStructureFlowTdfyWrapper,
 )
+from .midi_sparse_structure_flow import (
+    MidiSparseStructureFlowModel,
+    MidiSparseStructureFlowTdfyWrapper,
+)
 from .dual_backbone_sparse_structure_flow import DualBackboneSparseStructureFlowTdfyWrapper
 
 def from_pretrained(path: str, **kwargs):

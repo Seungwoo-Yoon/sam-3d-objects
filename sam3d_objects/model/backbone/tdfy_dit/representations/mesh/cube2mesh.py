@@ -19,6 +19,8 @@ class MeshExtractResult:
         self.tsdf_v = None
         self.tsdf_s = None
         self.reg_loss = None
+        # sdf dense grid (always populated after __call__)
+        self.sdf_d = None
 
     def comput_face_normals(self, verts, faces):
         i0 = faces[..., 0].long()
@@ -149,6 +151,7 @@ class SparseFeatures2Mesh:
         mesh = MeshExtractResult(
             vertices=vertices, faces=faces, vertex_attrs=colors, res=self.res
         )
+        mesh.sdf_d = sdf_d  # dense SDF grid (res+1, res+1, res+1)
         if training:
             if mesh.success:
                 reg_loss += L_dev.mean() * 0.5

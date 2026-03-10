@@ -118,7 +118,9 @@ class InferenceJoint:
             with_texture_baking=False,
             with_layout_postprocess=False,
             use_vertex_color=True,
-            stage1_inference_steps=None,
+            stage1_inference_steps=12,
+            stage2_inference_steps=12,
+            use_stage1_distillation=False,
             pointmap=pointmap,
         )
 

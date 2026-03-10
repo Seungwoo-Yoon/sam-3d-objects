@@ -194,7 +194,10 @@ def prepare_conditioning_for_scene(
     # Following the pattern from preprocess_image in Sam3DConditionedMixin
 
     # Convert pointmap to expected format [3, H, W]
-    pointmap_chw = pointmap.permute(2, 0, 1).contiguous()  # [3, H, W]
+    if pointmap is not None:
+        pointmap_chw = pointmap.permute(2, 0, 1).contiguous()  # [3, H, W]
+    else:
+        pointmap_chw = None
 
     # Process each object's RGBA image through the preprocessor
     batch_items = []

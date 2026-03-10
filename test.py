@@ -13,24 +13,42 @@ from inference_joint import InferenceJoint
 from sam3d_objects.custom.utils import *
 from sam3d_objects.model.backbone.tdfy_dit.models.dual_backbone_checkpoint_utils import load_dual_backbone_from_checkpoints
 
+from peft.peft_model import PeftModel
+
 PATH = os.getcwd()
 TAG = "hf"
 config_path = f"{PATH}/../checkpoints/{TAG}/pipeline.yaml"
 inference = InferenceJoint(config_path, compile=False)
 
-checkpoint = torch.load(f"{PATH}/../outputs/joint_sam3d_5/step_00005200.pt", map_location='cuda', weights_only=False)
-
-inference._pipeline.models["ss_generator"].reverse_fn.backbone.load_state_dict(
-    checkpoint["model_state_dict"],
-    strict=False
-)
-
+# checkpoint = torch.load(f"{PATH}/../outputs/joint_sam3d_5/step_00005200.pt", map_location='cuda', weights_only=False)
+#
+# inference._pipeline.models["ss_generator"].reverse_fn.backbone.load_state_dict(
+#     checkpoint["model_state_dict"],
+#     strict=False
+# )
+#
 # print(checkpoint["model_state_dict"].keys())
 # random sample 20 keys
-sample_keys = list(checkpoint["model_state_dict"].keys())[:20]
-print("Sample keys from checkpoint:")
-for k in sample_keys:
-    print(k)
+# sample_keys = list(checkpoint["model_state_dict"].keys())[:20]
+# print("Sample keys from checkpoint:")
+# for k in sample_keys:
+#     print(k)
+
+# lora_checkpoint = torch.load(f"{PATH}/../outputs/midi_sam3d_test/step_00000010.pt", map_location='cuda', weights_only=False)
+
+# inference._pipeline.models["ss_generator"].reverse_fn.backbone = PeftModel.from_pretrained(
+#     inference._pipeline.models["ss_generator"].reverse_fn.backbone,
+#     f"{PATH}/../outputs/midi_sam3d_2/step_00006500_peft",
+#     device_map="auto",
+# )
+
+inference._pipeline.models["ss_generator"].reverse_fn.backbone = PeftModel.from_pretrained(
+    inference._pipeline.models["ss_generator"].reverse_fn.backbone,
+    f"{PATH}/../outputs/flow_grpo_test/step_00000250_peft",
+    device_map="auto",
+)
+
+inference._pipeline.models["ss_generator"].reverse_fn.strength = 0.0
 
 IMAGE_PATH = f"{PATH}/images/segment2/image.jpg"
 IMAGE_NAME = os.path.basename(os.path.dirname(IMAGE_PATH))
@@ -44,7 +62,7 @@ pointmap = torch.from_numpy(pointmap).cuda()
 print(pointmap.shape)
 
 # outputs = [inference(image, mask, seed=20) for mask in masks]
-outputs = inference(image, masks, seed=20)
+outputs = inference(image, masks, seed=50)
 
 if 'voxel' in outputs[0]:
     for i, output in enumerate(outputs):

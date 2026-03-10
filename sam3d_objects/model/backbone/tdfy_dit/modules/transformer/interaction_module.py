@@ -130,7 +130,18 @@ class MOTModulatedTransformerGlobalBlock(nn.Module):
             partial(self._apply_msa, scale_msa=scale_msa, shift_msa=shift_msa),
             h
         )
+
+        # flatten h for self-attention, then unflatten back to dict of tensors
+        dim = {}
+        for latent_name in h.keys():
+            dim[latent_name] = h[latent_name].shape[1]
+            h[latent_name] = h[latent_name].reshape(1, -1, h[latent_name].shape[-1])
+        
         h = self.self_attn(h)
+
+        for latent_name in h.keys():
+            h[latent_name] = h[latent_name].reshape(-1, dim[latent_name], h[latent_name].shape[-1])
+
         h = _pytree.tree_map(
             partial(self._apply_multiplication, multiplier=gate_msa),
             h
@@ -169,35 +180,36 @@ class MOTModulatedTransformerGlobalBlock(nn.Module):
         return x
 
     def forward(self, x: Dict, mod: torch.Tensor, context: torch.Tensor):
-        flattened_x = {}
+        # flattened_x = {}
 
-        # print(f'mod.shape: {mod.shape}')
-        # print(f'context.shape: {context.shape}')
-        
-        flattened_context = context.reshape(1, -1, context.shape[-1])
+        # flattened_context = context.reshape(1, -1, context.shape[-1])
 
         # for latent_name in x.keys():
-        #     print(f'x[{latent_name}].shape: {x[latent_name].shape}')
+        #     flattened_x[latent_name] = x[latent_name].reshape(1, -1, x[latent_name].shape[-1])
 
-        for latent_name in x.keys():
-            flattened_x[latent_name] = x[latent_name].reshape(1, -1, x[latent_name].shape[-1])
-        
-        # for latent_name in flattened_x.keys():
-        #     print(f'flattened_x[{latent_name}].shape: {flattened_x[latent_name].shape}')
+        # x and context are flattened to batch=1, but mod (timestep embedding) retains
+        # shape [B, C]. When B > 1, _apply_msa broadcasts mod against the flattened
+        # h=[1,L,C], expanding h to [B,L,C], which then mismatches context=[1,Lkv,C].
+        # Fix: also collapse mod to [1, C] using mean across the batch dimension.
+        # flattened_mod = mod.mean(dim=0, keepdim=True) if mod.shape[0] > 1 else mod
 
         if self.use_checkpoint:
+            # ret = torch.utils.checkpoint.checkpoint(
+            #     self._forward, flattened_x, flattened_mod, flattened_context, use_reentrant=False
+            # )
             ret = torch.utils.checkpoint.checkpoint(
-                self._forward, flattened_x, mod, flattened_context, use_reentrant=False
+                self._forward, x, mod, context, use_reentrant=False
             )
         else:
-            ret = self._forward(flattened_x, mod, flattened_context)
+            # ret = self._forward(flattened_x, flattened_mod, flattened_context)
+            ret = self._forward(x, mod, context)
 
         # for latent_name in ret.keys():
         #     print(f'ret[{latent_name}].shape: {ret[latent_name].shape}')
 
-        for latent_name in ret.keys():
-            ret[latent_name] = ret[latent_name].reshape(
-                x[latent_name].shape[0], x[latent_name].shape[1], x[latent_name].shape[2]
-            )
+        # for latent_name in ret.keys():
+        #     ret[latent_name] = ret[latent_name].reshape(
+        #         x[latent_name].shape[0], x[latent_name].shape[1], x[latent_name].shape[2]
+        #     )
 
         return ret

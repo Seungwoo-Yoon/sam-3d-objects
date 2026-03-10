@@ -398,7 +398,7 @@ class ShortCut(FlowMatching):
             "self_consistency_loss": self_consistency_loss_val,
         }
         return total_loss, detail_losses
-        
+     
     def _prepare_t_and_d(self, steps=None):
         """Prepare time sequence and step size for inference"""
         steps = self.inference_steps if steps is None else steps

@@ -786,6 +786,10 @@ class InferencePipeline:
                     slat_input,
                     self.slat_condition_input_mapping,
                 )
+                # print(condition_args[0].shape)
+                print(latent_shape
+                )
+                print(coords.shape)
                 condition_args += (coords.cpu().numpy(),)
                 slat = slat_generator(
                     latent_shape, DEVICE, *condition_args, **condition_kwargs

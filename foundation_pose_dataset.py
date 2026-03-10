@@ -769,10 +769,11 @@ class FoundationPoseDataset(Dataset):
 
         # Filter if too many objects
         if num_objects > self.max_objects_per_scene:
-            logger.warning(
-                f"Scene {scene_id} has {num_objects} objects, "
-                f"exceeding max {self.max_objects_per_scene}. Sampling subset."
-            )
+            # TODO: rollback warning message
+            # logger.warning(
+            #     f"Scene {scene_id} has {num_objects} objects, "
+            #     f"exceeding max {self.max_objects_per_scene}. Sampling subset."
+            # )
             selected_indices = np.random.choice(
                 num_objects,
                 self.max_objects_per_scene,
