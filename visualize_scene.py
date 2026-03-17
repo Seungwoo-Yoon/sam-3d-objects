@@ -347,10 +347,10 @@ def render_3d_topdown(scene: trimesh.Scene, save_path: str | None = None):
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize a FoundationPose scene")
-    parser.add_argument("--data-root", type=str, default="/workspace/sam-3d-objects/foundationpose",
+    parser.add_argument("--data-root", type=str, default="./foundationpose_test/3062903437",
                         help="FoundationPose data root")
     parser.add_argument("--gso-root", type=str,
-                        default="/workspace/sam-3d-objects/gso/google_scanned_objects/models_normalized",
+                        default="./gso/google_scanned_objects/models_normalized",
                         help="GSO mesh root (models_orig/)")
     parser.add_argument("--scene-idx", type=int, default=0, help="Scene index to visualize")
     parser.add_argument("--save-dir", type=str, default="vis_scene", help="Output directory")
@@ -451,6 +451,15 @@ def main():
     if not args.no_3d:
         print("\nBuilding 3D scene with GSO meshes ...")
         scene_3d = build_3d_scene(visible_objects, latents, gso_root)
+
+        if "camera_view_transform" in conditionals:
+            # add ground plane (z=0) for reference, transformed to match camera view
+            cam_T = conditionals["camera_view_transform"].numpy()  # [4,4
+            plane = trimesh.creation.box(extents=(10, 10, 0.01))
+            plane.apply_translation((0, 0, -0.005))
+            plane.apply_transform(cam_T)
+            plane.visual = trimesh.visual.ColorVisuals(mesh=plane, vertex_colors=[200, 200, 200, 100])
+            scene_3d.add_geometry(plane, node_name="ground_plane")
 
         # Save as GLB for interactive viewing
         glb_path = save_dir / "scene.glb"

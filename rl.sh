@@ -9,7 +9,7 @@ python train_flow_grpo_foundationpose.py \
     --slat_decoder_mesh_config  checkpoints/hf/slat_decoder_mesh.yaml \
     --slat_decoder_mesh_checkpoint checkpoints/hf/slat_decoder_mesh.ckpt \
     --data_root ./foundationpose_test \
-    --output_dir ./outputs/flow_grpo_test \
+    --output_dir ./outputs/flow_grpo_pointmap \
     --pipeline_config checkpoints/hf/pipeline.yaml \
     --group_size 16 \
     --t_train_steps 10 \
@@ -22,5 +22,5 @@ python train_flow_grpo_foundationpose.py \
     --t_sde_steps 2 \
     --sde_a 0.4 \
     --kl_coeff 0.01 \
-    --resume ./outputs/flow_grpo_test/step_00000250.pt \
+    # --resume ./outputs/flow_grpo_test/step_00000250.pt \
     # --save_interval_steps 1 \

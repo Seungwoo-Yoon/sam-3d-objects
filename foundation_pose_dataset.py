@@ -660,6 +660,7 @@ class FoundationPoseDataset(Dataset):
 
         # Add camera intrinsics
         conditionals['camera_K'] = torch.from_numpy(camera_params['camera_K']).float()
+        conditionals['camera_view_transform'] = torch.from_numpy(camera_params['camera_view_transform']).float()
 
         # Add image as conditioning
         if 'image' in frame_data:

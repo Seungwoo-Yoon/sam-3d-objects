@@ -15,6 +15,7 @@ from sam3d_objects.model.backbone.tdfy_dit.models.dual_backbone_checkpoint_utils
 
 from peft.peft_model import PeftModel
 
+POINTMAP = True
 PATH = os.getcwd()
 TAG = "hf"
 config_path = f"{PATH}/../checkpoints/{TAG}/pipeline.yaml"
@@ -44,22 +45,17 @@ inference = InferenceJoint(config_path, compile=False)
 
 inference._pipeline.models["ss_generator"].reverse_fn.backbone = PeftModel.from_pretrained(
     inference._pipeline.models["ss_generator"].reverse_fn.backbone,
-    f"{PATH}/../outputs/flow_grpo_test/step_00000250_peft",
+    f"{PATH}/../outputs/flow_grpo_pointmap/step_00000250_peft",
     device_map="auto",
 )
 
-inference._pipeline.models["ss_generator"].reverse_fn.strength = 0.0
+# inference._pipeline.models["ss_generator"].reverse_fn.strength = 0.0
 
 IMAGE_PATH = f"{PATH}/images/segment2/image.jpg"
 IMAGE_NAME = os.path.basename(os.path.dirname(IMAGE_PATH))
 
 image = load_image(IMAGE_PATH)
 masks = load_masks(os.path.dirname(IMAGE_PATH), extension=".png")
-
-pointmap = np.load('../test_pointmap.npy')
-pointmap = torch.from_numpy(pointmap).cuda()
-
-print(pointmap.shape)
 
 # outputs = [inference(image, mask, seed=20) for mask in masks]
 outputs = inference(image, masks, seed=50)
@@ -137,6 +133,33 @@ scene_gs = make_scene(*outputs)
 
 # export posed gaussian splatting (as point cloud)
 scene_gs.save_ply(f"{PATH}/gaussians/{IMAGE_NAME}_posed.ply")
+
+# Add pointmap points as tiny green gaussians for visualization
+if POINTMAP:
+    _C0 = 0.28209479177387814
+    pointmap_pts = torch.cat(
+        [out["pointmap"].reshape(-1, 3) for out in outputs_copy], dim=0
+    ).to(scene_gs._xyz.device)
+    M = pointmap_pts.shape[0]
+    device = scene_gs._xyz.device
+
+    pm_xyz_norm = (pointmap_pts - scene_gs.aabb[None, :3]) / scene_gs.aabb[None, 3:]
+    pm_scaling = torch.full((M, 3), -7.0, device=device)
+    pm_rotation = torch.zeros(M, 4, device=device)
+    pm_opacity = (torch.logit(torch.tensor(0.99, device=device)) - scene_gs.opacity_bias).expand(M, 1).clone()
+    green_f_dc = torch.tensor(
+        [[[(0.0 - 0.5) / _C0, (1.0 - 0.5) / _C0, (0.0 - 0.5) / _C0]]],
+        device=device,
+    ).expand(M, 1, 3).clone()
+
+    scene_gs._xyz = torch.cat([scene_gs._xyz, pm_xyz_norm], dim=0)
+    scene_gs._features_dc = torch.cat([scene_gs._features_dc, green_f_dc], dim=0)
+    if scene_gs._features_rest is not None:
+        pm_features_rest = torch.zeros(M, scene_gs._features_rest.shape[1], 3, device=device)
+        scene_gs._features_rest = torch.cat([scene_gs._features_rest, pm_features_rest], dim=0)
+    scene_gs._scaling = torch.cat([scene_gs._scaling, pm_scaling], dim=0)
+    scene_gs._rotation = torch.cat([scene_gs._rotation, pm_rotation], dim=0)
+    scene_gs._opacity = torch.cat([scene_gs._opacity, pm_opacity], dim=0)
 
 scene_gs = ready_gaussian_for_video_rendering(scene_gs)
 # export gaussian splatting (as point cloud)
