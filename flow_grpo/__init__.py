@@ -13,7 +13,7 @@ from .generation import generate_sde_group
 from .decoding import decode_shape_to_sdf
 from .reward import compute_reward
 from .loss import compute_grpo_loss_single
-from .trainer import train_epoch_grpo
+from .trainer import train_epoch_grpo, RunningStats
 
 __all__ = [
     "load_ss_decoder",
@@ -31,4 +31,5 @@ __all__ = [
     "compute_reward",
     "compute_grpo_loss_single",
     "train_epoch_grpo",
+    "RunningStats",
 ]

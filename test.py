@@ -18,7 +18,7 @@ from peft.peft_model import PeftModel
 POINTMAP = True
 PATH = os.getcwd()
 TAG = "hf"
-config_path = f"{PATH}/../checkpoints/{TAG}/pipeline.yaml"
+config_path = f"{PATH}/../checkpoints/{TAG}/pipeline_original.yaml"
 inference = InferenceJoint(config_path, compile=False)
 
 # checkpoint = torch.load(f"{PATH}/../outputs/joint_sam3d_5/step_00005200.pt", map_location='cuda', weights_only=False)
@@ -43,15 +43,45 @@ inference = InferenceJoint(config_path, compile=False)
 #     device_map="auto",
 # )
 
-inference._pipeline.models["ss_generator"].reverse_fn.backbone = PeftModel.from_pretrained(
-    inference._pipeline.models["ss_generator"].reverse_fn.backbone,
-    f"{PATH}/../outputs/flow_grpo_pointmap/step_00000250_peft",
+# inference._pipeline.models["ss_generator"].reverse_fn.backbone = PeftModel.from_pretrained(
+#     inference._pipeline.models["ss_generator"].reverse_fn.backbone,
+#     f"{PATH}/../outputs/flow_grpo_test/step_00000900_peft",
+#     device_map="auto",
+# )
+
+import copy
+
+base_backbone = inference._pipeline.models["ss_generator"].reverse_fn.backbone
+
+# backbone1 = PeftModel.from_pretrained(
+#     copy.deepcopy(base_backbone),
+#     f"{PATH}/../outputs/midi_sam3d_2/step_00006500_peft",
+#     device_map="auto",
+# )
+
+backbone1 = PeftModel.from_pretrained(
+    copy.deepcopy(base_backbone),
+    f"{PATH}/../outputs/flow_grpo_mesh_intersection3/step_00000480_peft",
     device_map="auto",
 )
 
+print(inference._pipeline.models["ss_generator"].rescale_t)
+
+# backbone2 = PeftModel.from_pretrained(
+#     copy.deepcopy(base_backbone),
+#     f"{PATH}/../outputs/midi_sam3d_2/step_00006500_peft",
+#     device_map="auto",
+# )
+
+# for name, param in backbone1.named_parameters():
+#     if "lora" in name:
+#         print("lora diff for", name, param.data - backbone2.get_parameter(name).data)
+
+inference._pipeline.models["ss_generator"].reverse_fn.backbone = backbone1
+
 # inference._pipeline.models["ss_generator"].reverse_fn.strength = 0.0
 
-IMAGE_PATH = f"{PATH}/images/segment2/image.jpg"
+IMAGE_PATH = f"{PATH}/images/segment1/image.jpg"
 IMAGE_NAME = os.path.basename(os.path.dirname(IMAGE_PATH))
 
 image = load_image(IMAGE_PATH)
@@ -137,6 +167,7 @@ scene_gs.save_ply(f"{PATH}/gaussians/{IMAGE_NAME}_posed.ply")
 # Add pointmap points as tiny green gaussians for visualization
 if POINTMAP:
     _C0 = 0.28209479177387814
+
     pointmap_pts = torch.cat(
         [out["pointmap"].reshape(-1, 3) for out in outputs_copy], dim=0
     ).to(scene_gs._xyz.device)

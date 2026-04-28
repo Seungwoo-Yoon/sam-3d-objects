@@ -47,20 +47,23 @@ def rot6d_to_matrix(r6d: np.ndarray) -> np.ndarray:
 
 def p3d_to_bop(R_p3d: np.ndarray, t_p3d: np.ndarray):
     """Convert P3D pose → BOP pose.  R_bop = M @ R_p3d @ M,  t_bop = M @ t_p3d."""
-    return (_M @ R_p3d @ _M).astype(np.float64), (_M @ t_p3d).astype(np.float64)
+    # return (_M @ R_p3d @ _M).astype(np.float64), (_M @ t_p3d).astype(np.float64)
+    return R_p3d @ _M, t_p3d
 
 
 # ─── ADD-S (BOP convention throughout) ──────────────────────────────────────
 
 def compute_adds(
-    model_pts: np.ndarray,   # [N, 3] PLY model space (BOP), mm
+    gt_pts: np.ndarray,      # [N, 3] GT model space (BOP), mm
     R_gt:   np.ndarray,      # [3, 3] BOP
     t_gt:   np.ndarray,      # [3]    BOP, mm
     R_pred: np.ndarray,      # [3, 3] BOP
     t_pred: np.ndarray,      # [3]    BOP, mm
+    pred_pts: np.ndarray | None = None,  # [M, 3] pred model space (BOP), mm; falls back to gt_pts
 ) -> float:
-    P_gt   = (R_gt   @ model_pts.T).T + t_gt
-    P_pred = (R_pred @ model_pts.T).T + t_pred
+    P_gt   = (R_gt   @ gt_pts.T).T + t_gt
+    pts    = pred_pts if pred_pts is not None else gt_pts
+    P_pred = (R_pred @ pts.T).T + t_pred
     dists  = np.linalg.norm(P_gt[:, None] - P_pred[None], axis=-1)
     return float(dists.min(axis=1).mean())
 
@@ -84,6 +87,35 @@ def apply_bop_pose_to_ply(
     verts = mesh.vertices.astype(np.float64)
     mesh.vertices = (R_bop @ verts.T).T + t_bop
     return mesh
+
+
+def get_pred_model_pts(
+    glb,
+    scale: np.ndarray,   # [3]
+    max_pts: int = 4096,
+) -> np.ndarray | None:
+    """
+    Extract predicted mesh vertices in BOP model space (local, before pose).
+
+    SAM3D local → BOP local:
+      p_bop_local = M @ (scale * p_local)
+    """
+    if glb is None:
+        return None
+    if isinstance(glb, trimesh.Scene):
+        parts = [g for g in glb.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        if not parts:
+            return None
+        mesh = trimesh.util.concatenate([p.copy() for p in parts])
+    elif isinstance(glb, trimesh.Trimesh):
+        mesh = glb.copy()
+    else:
+        return None
+
+    pts, _ = trimesh.sample.sample_surface(mesh, max_pts)
+    pts = pts.astype(np.float64) * scale[None, :]  # apply scale
+    pts = (_M @ pts.T).T                            # P3D local → BOP local
+    return pts
 
 
 def apply_bop_pose_to_sam3d_glb(
@@ -116,6 +148,56 @@ def apply_bop_pose_to_sam3d_glb(
     verts = (R_bop @ verts.T).T + t_bop                        # BOP camera space
     mesh.vertices = verts
     return mesh
+
+
+# ─── Collision score ────────────────────────────────────────────────────────
+
+def compute_collision_score(pred_meshes_cam: list) -> float:
+    """
+    Collision score = (# objects involved in any mesh-mesh collision) / (total objects).
+
+    Meshes must all be in the same coordinate frame (BOP camera space).
+    Objects whose GLB was unavailable (None) are counted in the denominator
+    but cannot be flagged as colliding.
+
+    Uses AABB pre-filter then FCL BVH (trimesh CollisionManager).
+    """
+    n_total = len(pred_meshes_cam)
+    valid = [(i, m) for i, m in enumerate(pred_meshes_cam) if m is not None]
+    if n_total == 0 or len(valid) < 2:
+        return 0.0
+
+    # AABB pre-filter: keep only meshes that overlap with at least one other
+    aabb_min = {vi: m.vertices.min(axis=0) for vi, m in valid}
+    aabb_max = {vi: m.vertices.max(axis=0) for vi, m in valid}
+
+    candidates: set = set()
+    vis = [vi for vi, _ in valid]
+    for a in range(len(vis)):
+        for b in range(a + 1, len(vis)):
+            vi, vj = vis[a], vis[b]
+            if np.all(aabb_min[vi] <= aabb_max[vj]) and np.all(aabb_max[vi] >= aabb_min[vj]):
+                candidates.add(vi)
+                candidates.add(vj)
+
+    if len(candidates) < 2:
+        return 0.0
+
+    manager = trimesh.collision.CollisionManager()
+    for vi, mesh in valid:
+        if vi in candidates:
+            manager.add_object(str(vi), mesh)
+
+    is_collision, colliding_pairs = manager.in_collision_internal(return_names=True)
+    if not is_collision:
+        return 0.0
+
+    colliding_objects: set = set()
+    for name_i, name_j in colliding_pairs:
+        colliding_objects.add(int(name_i))
+        colliding_objects.add(int(name_j))
+
+    return len(colliding_objects) / n_total
 
 
 # ─── Main eval loop ─────────────────────────────────────────────────────────
@@ -161,6 +243,7 @@ def run_eval(args):
         inference._pipeline.models["ss_generator"].reverse_fn.backbone = (
             PeftModel.from_pretrained(backbone, args.checkpoint, device_map="auto")
         )
+        inference._pipeline.models["ss_generator"].reverse_fn.strength = 0.0
         print(f"Loaded LoRA checkpoint: {args.checkpoint}")
 
     # ── Output dirs ──────────────────────────────────────────────────────────
@@ -170,6 +253,8 @@ def run_eval(args):
     # ── Metrics accumulator ──────────────────────────────────────────────────
     per_obj_adds: dict[int, list[float]] = defaultdict(list)  # obj_id → [adds_score, ...]
     all_adds: list[float] = []
+    per_scene_collision: dict[str, list[float]] = defaultdict(list)  # scene_id → [collision_score, ...]
+    all_collision: list[float] = []
 
     # ── Main loop ────────────────────────────────────────────────────────────
     for idx in range(len(dataset)):
@@ -213,7 +298,7 @@ def run_eval(args):
         # Accumulators for scene-level GLB (one scene per frame)
         pred_parts: list[trimesh.Trimesh] = []
         gt_parts:   list[trimesh.Trimesh] = []
-
+        pred_meshes_cam: list = []   # for collision detection (None if GLB unavailable)
 
         for i, (obj_id, output) in enumerate(zip(obj_ids, outputs)):
             # ── GT pose → BOP ─────────────────────────────────────────────
@@ -229,19 +314,28 @@ def run_eval(args):
             ).squeeze(0).numpy()
             R_pred_bop, t_pred_bop = p3d_to_bop(R_p3d_pred, t_p3d_pred)
 
-            # ── ADD-S (BOP model pts, BOP poses) ──────────────────────────
+            # ── Pred mesh in BOP camera space (for collision + optional save) ──
+            pred_cam = apply_bop_pose_to_sam3d_glb(
+                output.get('glb'), R_pred_bop, t_pred_bop, scale_pred
+            )
+            pred_meshes_cam.append(pred_cam)   # None if GLB unavailable
+
+            # ── ADD-S (GT model pts → P_gt, pred mesh pts → P_pred) ──────
             gt_mesh = get_model_mesh(obj_id)
             if gt_mesh is None:
                 print(f"  [WARN] no mesh for obj {obj_id}, skipping")
                 continue
 
-            model_pts = gt_mesh.vertices.astype(np.float64)  # BOP model space
-            if len(model_pts) > 4096:
-                idx_rng = np.random.choice(len(model_pts), 4096, replace=False)
-                model_pts = model_pts[idx_rng]
+            gt_pts, _ = trimesh.sample.sample_surface(gt_mesh, 4096)
+            gt_pts = gt_pts.astype(np.float64)  # BOP model space
+
+            # Extract predicted mesh surface samples in BOP local space
+            pred_pts = get_pred_model_pts(output.get('glb'), scale_pred, max_pts=4096)
+            if pred_pts is None:
+                print(f"  [WARN] no predicted mesh for obj {obj_id}, falling back to GT pts for P_pred")
 
             diameter = float(models_info.get(obj_id, {}).get('diameter', 1.0))
-            adds_mm   = compute_adds(model_pts, R_gt_bop, t_gt_bop, R_pred_bop, t_pred_bop)
+            adds_mm   = compute_adds(gt_pts, R_gt_bop, t_gt_bop, R_pred_bop, t_pred_bop, pred_pts)
             adds_norm = adds_mm / diameter
 
             per_obj_adds[obj_id].append(adds_norm)
@@ -254,12 +348,16 @@ def run_eval(args):
             # ── Accumulate meshes for scene GLB (BOP camera space) ────────
             if args.save_meshes:
                 gt_parts.append(apply_bop_pose_to_ply(gt_mesh, R_gt_bop, t_gt_bop))
-
-                pred_cam = apply_bop_pose_to_sam3d_glb(
-                    output.get('glb'), R_pred_bop, t_pred_bop, scale_pred
-                )
                 if pred_cam is not None:
                     pred_parts.append(pred_cam)
+
+        # ── Collision score for this frame ────────────────────────────────
+        if n_obj > 1:
+            col_score = compute_collision_score(pred_meshes_cam)
+            per_scene_collision[str(scene_id)].append(col_score)
+            all_collision.append(col_score)
+            print(f"  collision score: {col_score:.4f}  "
+                  f"({round(col_score * n_obj)}/{n_obj} objects colliding)")
 
         # ── Export per-frame scene GLBs (GT + pred combined) ──────────────
         if args.save_meshes and (gt_parts or pred_parts):
@@ -302,12 +400,33 @@ def run_eval(args):
     print(f"  {'ALL':>6}  {len(all_adds):8d}  {overall_mean:12.4f}  {overall_pass:10.4f}")
     print("=" * 60)
 
+    # ── Collision report ─────────────────────────────────────────────────────
+    if all_collision:
+        print("\n" + "=" * 60)
+        print("Collision Score  (colliding objects / total objects per frame)")
+        print("=" * 60)
+        print(f"\n{'scene_id':>10}  {'#frames':>8}  {'mean collision':>16}")
+        print("-" * 42)
+        for sid in sorted(per_scene_collision.keys()):
+            scores = per_scene_collision[sid]
+            print(f"  {sid:>8}  {len(scores):8d}  {np.mean(scores):16.4f}")
+        print("-" * 42)
+        print(f"  {'ALL':>8}  {len(all_collision):8d}  {np.mean(all_collision):16.4f}")
+        print("=" * 60)
+
     # Save JSON summary
+    collision_summary = {
+        sid: {'mean': float(np.mean(v)), 'n': len(v)}
+        for sid, v in per_scene_collision.items()
+    }
     result = {
         'threshold': args.threshold,
         'overall': {'mean_adds': overall_mean, 'pass_rate': overall_pass, 'n': len(all_adds)},
-        'per_object': {
-            str(k): v for k, v in summary.items()
+        'per_object': {str(k): v for k, v in summary.items()},
+        'collision': {
+            'overall_mean': float(np.mean(all_collision)) if all_collision else None,
+            'n_frames': len(all_collision),
+            'per_scene': collision_summary,
         },
     }
     result_path = out_dir / "adds_results.json"
@@ -322,7 +441,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate SAM3D on YCB-V with ADD-S metric")
     parser.add_argument("--data-root",   default="YCB-V",         help="YCB-V BOP data root")
     parser.add_argument("--models-root", default="YCB-models",    help="YCB-models directory")
-    parser.add_argument("--config",      default="checkpoints/hf/pipeline.yaml")
+    parser.add_argument("--config",      default="checkpoints/hf/pipeline_original.yaml")
     parser.add_argument("--checkpoint",  default=None,
                         help="Optional LoRA PEFT checkpoint dir to load into ss_generator")
     parser.add_argument("--scenes",      nargs="+", type=int, default=[48],

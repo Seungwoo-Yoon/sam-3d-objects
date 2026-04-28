@@ -4,6 +4,8 @@ from ...modules.sparse import SparseTensor
 from easydict import EasyDict as edict
 from .utils_cube import *
 from .flexicubes.flexicubes import FlexiCubes
+import numpy as np
+from scipy.ndimage import distance_transform_edt
 
 
 class MeshExtractResult:
@@ -152,11 +154,50 @@ class SparseFeatures2Mesh:
             vertices=vertices, faces=faces, vertex_attrs=colors, res=self.res
         )
         mesh.sdf_d = sdf_d  # dense SDF grid (res+1, res+1, res+1)
-        if training:
-            if mesh.success:
-                reg_loss += L_dev.mean() * 0.5
-            reg_loss += (weights[:, :20]).abs().mean() * 0.2
-            mesh.reg_loss = reg_loss
-            mesh.tsdf_v = get_defomed_verts(v_pos, v_attrs[:, 1:4], self.res)
-            mesh.tsdf_s = v_attrs[:, 0]
+
+        # Fill unoccupied SDF values with proper distances.
+        # get_dense_attrs initialises unoccupied positions to 1.0 which is not a real SDF.
+        # Use scipy's Euclidean Distance Transform (O(N)) to propagate the known SDF
+        # outward from occupied voxels:
+        #   SDF_unoccupied = EDT_dist + SDF_nearest_occupied
+        # If the nearest occupied voxel is exterior (+), we add the extra distance.
+        # If it is interior (-), we subtract it (the unoccupied voxel crosses the surface).
+        # if vertices.shape[0] > 0:
+        #     with torch.no_grad():
+        #         res1 = self.res + 1
+        #         v_pos_int = v_pos.long()
+
+        #         # 3-D boolean mask: True where the sparse tensor populated a vertex
+        #         occ_np = np.zeros((res1, res1, res1), dtype=bool)
+        #         vp = v_pos_int.cpu().numpy()
+        #         occ_np[vp[:, 0], vp[:, 1], vp[:, 2]] = True
+
+        #         # EDT: Euclidean distance (local-coord units) to nearest occupied voxel,
+        #         # plus the index array of that nearest voxel for every grid position.
+        #         edt, nearest = distance_transform_edt(
+        #             ~occ_np, sampling=1.0 / self.res, return_indices=True
+        #         )
+
+        #         sdf_np = sdf_d.cpu().float().numpy().reshape(res1, res1, res1)
+        #         nearest_sdf = sdf_np[nearest[0], nearest[1], nearest[2]]
+
+        #         # Propagate SDF to unoccupied positions.
+        #         # sign(nearest_sdf) gives direction: exterior(+1) adds EDT, interior(-1) negates EDT.
+        #         # Occupied positions keep their original network-predicted SDF.
+        #         sdf_filled = sdf_np.copy()
+        #         mask = ~occ_np
+        #         sign = np.where(nearest_sdf[mask] < 0, -1.0, 1.0)
+        #         sdf_filled[mask] = np.clip(sign * edt[mask] + nearest_sdf[mask], -1.0, 1.0)
+
+        #         mesh.sdf_d = torch.from_numpy(sdf_filled).to(
+        #             dtype=sdf_d.dtype, device=self.device
+        #         )
+
+        # if training:
+        #     if mesh.success:
+        #         reg_loss += L_dev.mean() * 0.5
+        #     reg_loss += (weights[:, :20]).abs().mean() * 0.2
+        #     mesh.reg_loss = reg_loss
+        #     mesh.tsdf_v = get_defomed_verts(v_pos, v_attrs[:, 1:4], self.res)
+        #     mesh.tsdf_s = v_attrs[:, 0]
         return mesh

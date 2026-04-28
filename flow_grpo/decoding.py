@@ -52,39 +52,69 @@ def decode_shape_to_sdf(
 
     meshes = []
 
-    for i, object_embed in enumerate(cond_embed):
+    # for i, object_embed in enumerate(cond_embed):
+    #     # 3. slat_generator  (coords passed as numpy, same as inference_pipeline)
+    #     obj_coords = coords[coords[:, 0] == i]
+    #     if obj_coords.shape[0] == 0:
+    #         # This object has no voxels — append None as placeholder so that
+    #         # len(meshes) == len(cond_embed) and pose indices stay aligned.
+    #         logger.debug(f"Object {i} has no voxels, skipping mesh decode.")
+    #         meshes.append(None)
+    #         continue
+
+    #     # Reset batch index to 0 — each slat_generator call is single-object (batch=1)
+    #     obj_coords_local = obj_coords.clone()
+    #     obj_coords_local[:, 0] = 0
+    #     # Mirror inference_pipeline: prune interior voxels then cap at 42k for mesh decoding
+    #     obj_coords_local = prune_sparse_structure(obj_coords_local)
+    #     obj_coords_local, _ = downsample_sparse_structure(obj_coords_local)
+    #     if obj_coords_local.shape[0] == 0:
+    #         meshes.append(None)
+    #         continue
+
+    #     latent_shape = (1, obj_coords_local.shape[0], 8)
+    #     coords_np = obj_coords_local.cpu().numpy()
+
+    #     slat = slat_generator(latent_shape, device, object_embed[None, ...], coords_np)
+
+    #     slat = sp.SparseTensor(
+    #         coords=obj_coords_local,
+    #         feats=slat[0],
+    #     ).to(device)
+    #     slat = slat * SLAT_STD.to(device) + SLAT_MEAN.to(device)
+
+    #     # 4. slat_decoder_mesh  →  mesh / SDF
+    #     mesh_out = slat_decoder_mesh(slat)[0]
+    #     meshes.append(mesh_out)
+
+    for i in range(0, cond_embed.shape[0], 8):
         # 3. slat_generator  (coords passed as numpy, same as inference_pipeline)
-        obj_coords = coords[coords[:, 0] == i]
-        if obj_coords.shape[0] == 0:
-            # This object has no voxels — append None as placeholder so that
-            # len(meshes) == len(cond_embed) and pose indices stay aligned.
-            logger.debug(f"Object {i} has no voxels, skipping mesh decode.")
-            meshes.append(None)
+        start = i
+        end = min(i + 8, cond_embed.shape[0])
+        batch_coords = coords[(coords[:, 0] >= start) & (coords[:, 0] < end)]
+        if batch_coords.shape[0] == 0:
+            logger.debug(f"Objects {start} to {end-1} have no voxels, skipping mesh decode.")
+            meshes.extend([None] * (end - start))
+            continue
+        batch_coords_local = batch_coords.clone()
+        batch_coords_local[:, 0] = batch_coords_local[:, 0] - start
+
+        batch_coords_local = prune_sparse_structure(batch_coords_local)
+        batch_coords_local, _ = downsample_sparse_structure(batch_coords_local)
+        if batch_coords_local.shape[0] == 0:
+            meshes.extend([None] * (end - start))
             continue
 
-        # Reset batch index to 0 — each slat_generator call is single-object (batch=1)
-        obj_coords_local = obj_coords.clone()
-        obj_coords_local[:, 0] = 0
-        # Mirror inference_pipeline: prune interior voxels then cap at 42k for mesh decoding
-        obj_coords_local = prune_sparse_structure(obj_coords_local)
-        obj_coords_local, _ = downsample_sparse_structure(obj_coords_local)
-        if obj_coords_local.shape[0] == 0:
-            meshes.append(None)
-            continue
-
-        latent_shape = (1, obj_coords_local.shape[0], 8)
-        coords_np = obj_coords_local.cpu().numpy()
-
-        slat = slat_generator(latent_shape, device, object_embed[None, ...], coords_np)
-
+        latent_shape = (1, batch_coords_local.shape[0], 8)
+        coords_np = batch_coords_local.cpu().numpy()
+        slat = slat_generator(latent_shape, device, cond_embed[start:end], coords_np)
         slat = sp.SparseTensor(
-            coords=obj_coords_local,
+            coords=batch_coords_local,
             feats=slat[0],
         ).to(device)
         slat = slat * SLAT_STD.to(device) + SLAT_MEAN.to(device)
-
-        # 4. slat_decoder_mesh  →  mesh / SDF
-        mesh_out = slat_decoder_mesh(slat)[0]
-        meshes.append(mesh_out)
+        mesh_outs = slat_decoder_mesh(slat)
+        for j in range(end - start):
+            meshes.append(mesh_outs[j])
 
     return meshes

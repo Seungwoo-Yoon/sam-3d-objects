@@ -338,6 +338,7 @@ def save_checkpoint(
     save_path: str,
     is_distributed: bool = False,
     scaler: Optional[GradScaler] = None,
+    extra_state: Optional[Dict[str, Any]] = None,
 ):
     """Save LoRA training checkpoint (trainable params + optimizer state)."""
     if is_distributed and dist.get_rank() != 0:
@@ -363,13 +364,16 @@ def save_checkpoint(
         checkpoint["scheduler_state_dict"] = scheduler.state_dict()
     if scaler is not None:
         checkpoint["scaler_state_dict"] = scaler.state_dict()
+    if extra_state is not None:
+        checkpoint.update(extra_state)
 
     torch.save(checkpoint, save_path)
+
+    raw_model.reverse_fn.backbone.save_pretrained(save_path.replace(".pt", "_peft"))
+
     logger.info(
         f"Saved LoRA checkpoint to {save_path}"
     )
-
-    raw_model.reverse_fn.backbone.save_pretrained(save_path.replace(".pt", "_peft"))
 
 
 def load_checkpoint(

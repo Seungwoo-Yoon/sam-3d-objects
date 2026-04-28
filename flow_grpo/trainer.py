@@ -4,11 +4,48 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import trimesh
+from PIL import Image
+from pytorch3d.transforms import quaternion_to_matrix
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+
+class RunningStats:
+    """Welford's online algorithm for running mean and variance of advantages."""
+
+    def __init__(self):
+        self.count: int = 0
+        self.mean: float = 0.0
+        self.M2: float = 0.0
+
+    def update(self, values: torch.Tensor):
+        """Incorporate a new batch of scalar values."""
+        for x in values.tolist():
+            self.count += 1
+            delta = x - self.mean
+            self.mean += delta / self.count
+            delta2 = x - self.mean
+            self.M2 += delta * delta2
+
+    @property
+    def std(self) -> float:
+        if self.count < 2:
+            return 1.0
+        return (self.M2 / (self.count - 1)) ** 0.5
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {"count": self.count, "mean": self.mean, "M2": self.M2}
+
+    def load_state_dict(self, d: Dict[str, Any]):
+        self.count = d["count"]
+        self.mean = d["mean"]
+        self.M2 = d["M2"]
+
 
 from sam3d_objects.data.utils import to_device
 from sam3d_objects.utils.dist_utils import unwrap_dist
@@ -58,6 +95,7 @@ def train_epoch_grpo(
     is_distributed: bool = False,
     best_reward: float = -float("inf"),
     cfg_strength: float = 7.0,
+    adv_stats: Optional[RunningStats] = None,
 ) -> Tuple[Dict[str, float], float]:
     """GRPO training epoch."""
     model.train()
@@ -80,6 +118,10 @@ def train_epoch_grpo(
         try:
             conditionals = to_device(batch["conditionals"], device)
             scene_num_objects = batch["num_objects"]
+
+            # GT pose (from latents) and GT mesh data — present only when load_meshes=True
+            gt_latents   = to_device(batch.get("latents",   {}), device)
+            gt_mesh_data = to_device(batch["mesh_data"], device) if "mesh_data" in batch else None
 
             # -----------------------------------------------------------------
             # Prepare SS conditioning (same as LoRA training)
@@ -173,13 +215,129 @@ def train_epoch_grpo(
                     device=device,
                 )
 
+                # [DEBUG] Output combined mesh (Only for the first trajectory)
+                # Also save the input image for reference
+                # if g_idx == 0 and rank == 0 and output_dir is not None and len(meshes) > 0:
+                #     try:
+                #         debug_dir = output_dir / "debug"
+                #         debug_dir.mkdir(parents=True, exist_ok=True)
+                #         tag = f"step{global_step + step:06d}"
+
+                #         # Build per-object trimesh and apply predicted pose transform
+                #         combined_meshes = []
+                #         for obj_idx, m in enumerate(meshes):
+                #             if m is None or not m.success:
+                #                 continue
+                #             verts = m.vertices.detach().cpu().float().numpy()
+                #             faces = m.faces.detach().cpu().numpy()
+                #             tri = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+                #             s = scale[obj_idx, 0].detach().cpu().float().numpy()       # (3,)
+                #             q = rotation[obj_idx, 0].detach().cpu().float()             # (4,) [w,x,y,z]
+                #             t = translation[obj_idx, 0].detach().cpu().float().numpy()  # (3,)
+
+                #             R = quaternion_to_matrix(q).numpy()  # (3, 3)
+                #             M = np.eye(4)
+                #             M[:3, :3] = R @ np.diag([1, 1, 1]) @ np.diag(s)
+                #             M[:3, 3] = t
+                #             tri.apply_transform(M)
+                #             combined_meshes.append(tri)
+
+                #         if combined_meshes:
+                #             combined = trimesh.util.concatenate(combined_meshes)
+                #             combined.export(str(debug_dir / f"{tag}_combined.glb"))
+
+                #         # Save GT meshes in camera space as GLB (one per object + combined)
+                #         if (
+                #             gt_mesh_data is not None
+                #             and gt_mesh_data.get("mesh_verts") is not None
+                #             and gt_latents.get("scale") is not None
+                #             and gt_latents.get("6drotation_normalized") is not None
+                #             and gt_latents.get("translation") is not None
+                #         ):
+                #             gt_verts_list = gt_mesh_data["mesh_verts"]   # list[Tensor(V,3)|None]
+                #             gt_faces_list = gt_mesh_data["mesh_faces"]   # list[Tensor(F,3)|None]
+                #             gt_avail      = gt_mesh_data["mesh_available"].cpu().numpy()
+                #             gt_s   = gt_latents["scale"].float().cpu().numpy()                  # (N, 3)
+                #             gt_r6d = gt_latents["6drotation_normalized"].float()                # (N, 6)
+                #             gt_t   = gt_latents["translation"].float().cpu().numpy()            # (N, 3)
+
+                #             # 6D rotation → matrix  (Zhou et al., 2019)
+                #             a1 = torch.nn.functional.normalize(gt_r6d[:, :3], dim=-1)
+                #             a2 = gt_r6d[:, 3:6]
+                #             a2 = torch.nn.functional.normalize(
+                #                 a2 - (a2 * a1).sum(-1, keepdim=True) * a1, dim=-1
+                #             )
+                #             a3 = torch.linalg.cross(a1, a2)
+                #             R_gt = torch.stack([a1, a2, a3], dim=-1).cpu().numpy()  # (N, 3, 3)
+
+                #             gt_tris = []
+                #             for obj_idx, (verts_t, faces_t) in enumerate(
+                #                 zip(gt_verts_list, gt_faces_list)
+                #             ):
+                #                 if not gt_avail[obj_idx] or verts_t is None or faces_t is None:
+                #                     continue
+                #                 verts = verts_t.cpu().float().numpy()  # (V, 3) in [-0.5, 0.5]
+                #                 faces = faces_t.cpu().numpy()
+                #                 # Apply GT pose: pts_cam = (verts * s) @ R^T + t
+                #                 M = np.eye(4)
+                #                 M[:3, :3] = R_gt[obj_idx] @ np.diag(gt_s[obj_idx])
+                #                 M[:3, 3]  = gt_t[obj_idx]
+                #                 tri = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+                #                 tri.apply_transform(M)
+                #                 # tri.export(str(debug_dir / f"{tag}_gt_obj{obj_idx}.glb"))
+                #                 gt_tris.append(tri)
+
+                #             if gt_tris:
+                #                 trimesh.util.concatenate(gt_tris).export(
+                #                     str(debug_dir / f"{tag}_gt_combined.glb")
+                #                 )
+
+                #         # Save input image with per-object mask overlay
+                #         img_tensor = conditionals["image"]  # [H, W, 3]
+                #         img_np = img_tensor.detach().cpu().numpy()
+                #         if img_np.dtype != np.uint8:
+                #             img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
+                #         vis = img_np.astype(np.float32)
+                #         if "object_masks" in conditionals:
+                #             masks_np = conditionals["object_masks"].detach().cpu().numpy()  # (N, H, W)
+                #             _COLORS = [
+                #                 (255,  60,  60),
+                #                 ( 60, 200,  60),
+                #                 ( 60, 120, 255),
+                #                 (255, 200,  40),
+                #                 (200,  60, 255),
+                #                 ( 40, 220, 220),
+                #             ]
+                #             for obj_idx, mask in enumerate(masks_np):
+                #                 color = _COLORS[obj_idx % len(_COLORS)]
+                #                 alpha = 0.45
+                #                 for c in range(3):
+                #                     vis[:, :, c] = np.where(
+                #                         mask > 0.5,
+                #                         vis[:, :, c] * (1 - alpha) + color[c] * alpha,
+                #                         vis[:, :, c],
+                #                     )
+                #         Image.fromarray(vis.clip(0, 255).astype(np.uint8)).save(
+                #             str(debug_dir / f"{tag}_input.png")
+                #         )
+                #     except Exception as _dbg_e:
+                #         logger.warning(f"[DEBUG] mesh/image save failed: {_dbg_e}")
+
                 if len(meshes) == 0:
                     all_reward_dicts.append(None)   # penalty for empty structure
                 else:
                     try:
-                        reward_dict = compute_reward(meshes, scale, rotation, translation,
-                                    conditionals["camera_view_transform"],
-                                    conditionals["pointmap"], conditionals["object_masks"])
+                        reward_dict = compute_reward(
+                            meshes, scale, rotation, translation,
+                            conditionals["camera_view_transform"],
+                            conditionals["pointmap"], conditionals["object_masks"],
+                            gt_mesh_points=gt_mesh_data["mesh_points"]    if gt_mesh_data is not None else None,
+                            gt_scale=gt_latents.get("scale"),
+                            gt_rotation_6d=gt_latents.get("6drotation_normalized"),
+                            gt_translation=gt_latents.get("translation"),
+                            gt_mesh_available=gt_mesh_data["mesh_available"] if gt_mesh_data is not None else None,
+                        )
                     except NotImplementedError:
                         raise
                     except Exception as e:
@@ -201,31 +359,53 @@ def train_epoch_grpo(
 
             # -------------------------------------------------------------
             # Per-component advantage: normalize each reward component
-            # separately, then sum to get total advantage per trajectory.
+            # separately, then sum to get total advantage per object per trajectory.
+            # Each rd[k] is a tensor of shape (n_obj_g,); object count may vary
+            # across samples but is consistent across G trajectories for the same scene.
             # -------------------------------------------------------------
             reward_keys = next(rd for rd in all_reward_dicts if rd is not None).keys()
 
-            advantages = [0.0] * len(all_reward_dicts)
+            # advantages[g] = None or tensor of shape (n_obj_g,)
+            advantages = [None] * len(all_reward_dicts)
             for k in reward_keys:
-                vals = torch.tensor(
-                    [rd[k] if rd is not None else float("nan") for rd in all_reward_dicts],
-                    dtype=torch.float32, device=device,
-                )
-                valid = ~torch.isnan(vals)
-                mean_k = vals[valid].mean()
-                std_k  = vals[valid].std().clamp(min=1e-8)
-                norm_k = torch.where(valid, (vals - mean_k) / std_k, torch.zeros_like(vals))
-                for g_idx in range(len(all_reward_dicts)):
-                    advantages[g_idx] += norm_k[g_idx].item()
+                k_vals = [(g_idx, rd[k]) for g_idx, rd in enumerate(all_reward_dicts) if rd is not None]
 
-            # Re-normalize summed advantages
-            adv_t    = torch.tensor(advantages, dtype=torch.float32, device=device)
-            adv_mean = adv_t.mean()
-            adv_std  = adv_t.std().clamp(min=1e-8)
-            advantages = ((adv_t - adv_mean) / adv_std).tolist()
+                # Stack valid trajectories → (n_valid, n_obj); compute per-object mean/std across trajectories
+                stacked = torch.stack([v for _, v in k_vals], dim=0)  # (n_valid, n_obj)
+                mean_k = stacked.mean(dim=0)                           # (n_obj,)
+                std_k  = stacked.std(dim=0).clamp(min=1e-8)           # (n_obj,)
+
+                if k == "collision":
+                    coeff = 3.0
+                else:
+                    coeff = 1.0
+
+                for g_idx, v in k_vals:
+                    norm_v = (v - mean_k) / std_k  # (n_obj,)
+                    if advantages[g_idx] is None:
+                        advantages[g_idx] = norm_v * coeff
+                    else:
+                        advantages[g_idx] = advantages[g_idx] + norm_v * coeff
+
+            # Re-normalize summed advantages using global running stats.
+            # g_mean / g_std are shared across all objects.
+            all_adv_vals = torch.cat([a for a in advantages if a is not None])  # all objects, all valid trajs
+            if adv_stats is None:
+                adv_stats = RunningStats()
+            adv_stats.update(all_adv_vals)
+            if adv_stats.count >= G * 2:
+                # Global normalization: stable across training
+                g_mean = all_adv_vals.new_tensor(adv_stats.mean)
+                g_std  = all_adv_vals.new_tensor(adv_stats.std).clamp(min=1e-8)
+                advantages = [((a - g_mean) / g_std) if a is not None else None for a in advantages]
+            else:
+                # Fall back to local batch normalization until enough samples
+                adv_mean = all_adv_vals.mean()
+                adv_std  = all_adv_vals.std().clamp(min=1e-8)
+                advantages = [((a - adv_mean) / adv_std) if a is not None else None for a in advantages]
 
             # Total rewards for logging
-            rewards = [sum(rd.values()) if rd is not None else -1.0 for rd in all_reward_dicts]
+            rewards = [sum(v.sum().item() for v in rd.values()) if rd is not None else -1.0 for rd in all_reward_dicts]
             reward_dicts = [rd for rd in all_reward_dicts if rd is not None]
             rewards_t = torch.tensor(rewards, dtype=torch.float32, device=device)
             r_mean    = rewards_t.mean()
@@ -242,6 +422,8 @@ def train_epoch_grpo(
 
             details_pg, details_kl = 0.0, 0.0
             for traj, adv_g in zip(trajectories, advantages):
+                if adv_g is None:
+                    continue
                 # backward is called per-step inside; returns scalars for logging
                 pg_val, kl_val = compute_grpo_loss_single(
                     model=raw_model,
@@ -274,14 +456,20 @@ def train_epoch_grpo(
 
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
-            optimizer.step()
+
+            # print("[DEBUG] Gradient norms:", {name: p.grad.norm().item() for name, p in raw_model.named_parameters() if p.grad is not None})
+            # print("[DEBUG] Parameter norms:", {name: p.norm().item() for name, p in unwrap_dist(model).named_parameters() if p.requires_grad and p.grad is not None})
+            if r_mean > 0:
+                optimizer.step()
 
             details = {
-                "pg_loss":     details_pg / n_terms,
-                "kl_loss":     details_kl / n_terms,
-                "total_loss":  (details_pg + kl_coeff * details_kl) / n_terms,
-                "reward_mean": r_mean.item(),
-                "reward_std":  r_std.item(),
+                "pg_loss":       details_pg / n_terms,
+                "kl_loss":       details_kl / n_terms,
+                "total_loss":    (details_pg + kl_coeff * details_kl) / n_terms,
+                "reward_mean":   r_mean.item(),
+                "reward_std":    r_std.item(),
+                "adv_global_mean": adv_stats.mean,
+                "adv_global_std":  adv_stats.std,
             }
 
             if scheduler is not None:
@@ -290,19 +478,24 @@ def train_epoch_grpo(
             total_loss_sum += details.get("total_loss", 0.0)
             total_pg_sum += details.get("pg_loss", 0.0)
             total_kl_sum += details.get("kl_loss", 0.0)
-            total_reward_sum += details.get("reward_mean", 0.0)
+            if r_mean > 0:
+                total_reward_sum += details.get("reward_mean", 0.0)
+            else:
+                logger.warning(f"Non-positive reward mean ({r_mean.item():.4f}) at step {step}, not updating model and not counting this scene for logging/ckpt.")
 
-            reward_key_count = {}
-            reward_value_sum = {}
-            for rd in reward_dicts:
-                if rd is not None:
-                    for k, v in rd.items():
-                        reward_key_count[k] = reward_key_count.get(k, 0) + 1
-                        reward_value_sum[k] = reward_value_sum.get(k, 0.0) + v
-            for k in reward_value_sum:
-                detailed_reward_sum[k] = detailed_reward_sum.get(k, 0.0) + reward_value_sum[k] / reward_key_count[k]
 
-            num_scenes += 1
+            if r_mean > 0:
+                reward_key_count = {}
+                reward_value_sum = {}
+                for rd in reward_dicts:
+                    if rd is not None:
+                        for k, v in rd.items():
+                            reward_key_count[k] = reward_key_count.get(k, 0) + 1
+                            reward_value_sum[k] = reward_value_sum.get(k, 0.0) + v.mean().item()
+                for k in reward_value_sum:
+                    detailed_reward_sum[k] = detailed_reward_sum.get(k, 0.0) + reward_value_sum[k] / reward_key_count[k]
+
+                num_scenes += 1
 
         except NotImplementedError:
             raise   # Propagate unimplemented reward
@@ -334,6 +527,9 @@ def train_epoch_grpo(
                     "train/reward_mean": avg_r,
                     "train/lr": lr,
                     "train/epoch": epoch,
+                    "train/adv_global_mean": adv_stats.mean,
+                    "train/adv_global_std": adv_stats.std,
+                    "train/adv_global_count": adv_stats.count,
                 }
                 detailed_avg_rewards = {f"train/{k}_reward": v / num_scenes for k, v in detailed_reward_sum.items()}
                 log_metrics(exp_logger, basic_info | detailed_avg_rewards, global_step + step)
@@ -351,11 +547,13 @@ def train_epoch_grpo(
                 "loss": total_loss_sum / num_scenes,
                 "reward_mean": total_reward_sum / num_scenes,
             }
+            _adv_extra = {"adv_stats": adv_stats.state_dict()}
             save_checkpoint(
                 model, optimizer, scheduler,
                 epoch, current_gs, step_metrics,
                 str(output_dir / f"step_{current_gs:08d}.pt"),
                 is_distributed,
+                extra_state=_adv_extra,
             )
             if step_metrics["reward_mean"] > current_best_reward:
                 current_best_reward = step_metrics["reward_mean"]
@@ -364,6 +562,7 @@ def train_epoch_grpo(
                     epoch, current_gs, step_metrics,
                     str(output_dir / "best.pt"),
                     is_distributed,
+                    extra_state=_adv_extra,
                 )
                 logger.info(f"New best reward: {current_best_reward:.4f}")
 

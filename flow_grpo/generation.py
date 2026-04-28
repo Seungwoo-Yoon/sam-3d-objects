@@ -47,8 +47,7 @@ def generate_sde_group(
     """
     # Switch model to eval (CFG active)
     model.eval()
-
-    model.rescale_t = 3
+    model.rescale_t = 3.0
 
     # Apply rescale_t the same way as ShortCut._prepare_t_and_d
     t_seq = np.linspace(0.0, 1.0, T_train + 1)
@@ -63,8 +62,11 @@ def generate_sde_group(
     )
     sde_index_set = set(sde_indices_sorted)
 
+    # Pick one component to perturb with noise; all G share the same choice
+    noisy_key = str(np.random.choice(["6drotation_normalized", "translation", "scale"]))
+
     trajectories = []
-    for _ in range(G):
+    for g in range(G):
         x_t = model._generate_noise(latent_shape_dict, device)
 
         # x_steps stores interleaved (x_in, x_out) for each SDE step + x_final
@@ -76,15 +78,20 @@ def generate_sde_group(
             dt = float(t_seq[step_idx + 1]) - t
 
             t_tensor = torch.tensor([t * time_scale], device=device, dtype=torch.float32)
-            d_tensor = torch.zeros(1, device=device, dtype=torch.float32)
+            # d_tensor = torch.zeros(1, device=device, dtype=torch.float32)
+            d_tensor = torch.tensor([dt * time_scale], device=device, dtype=torch.float32)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 v = model.reverse_fn.backbone(x_t, t_tensor, cond_embed, d=d_tensor)
 
             if step_idx in sde_index_set:
-                # SDE step: inject noise, store (x_in, x_out) for GRPO training
-                sigma = sde_sigma(t, a=sde_a)
-                eps   = {k: torch.randn_like(x_t[k]) for k in x_t}
+                # SDE step: inject noise only on noisy_key; others get zeros → ODE
+                # g==0 is fixed as ODE (sigma=0 → no noise injected)
+                sigma = 0.0 if g < G // 4 or g == 0 else sde_sigma(t, a=sde_a)
+                eps   = {
+                    k: (torch.randn_like(x_t[k]) if k == noisy_key else torch.zeros_like(x_t[k]))
+                    for k in x_t
+                }
                 mu, x_new = sde_step_dict(x_t, v, t, dt, sigma, eps)
 
                 x_steps.append({k: x_t[k].detach() for k in x_t})       # x_in
@@ -97,7 +104,6 @@ def generate_sde_group(
             else:
                 # ODE step: deterministic update, not stored
                 x_new = {k: (x_t[k] + v[k] * dt).detach() for k in x_t}
-                x_new["shape"] = (x_t["shape"] + v["shape"] * dt).detach()
 
             x_t = x_new
 
@@ -111,6 +117,7 @@ def generate_sde_group(
                 sigma_steps=sigma_steps,
                 t_steps=t_steps,
                 dt_steps=dt_steps,
+                noisy_key=noisy_key,
             )
         )
 

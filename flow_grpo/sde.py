@@ -39,6 +39,9 @@ def sde_mu_dict(
     for k in x_t:
         corr = correction_scale * (x_t[k] + t_safe * v[k])
         mu[k] = x_t[k] + (v[k] + corr) * dt
+
+    mu["shape"] = x_t["shape"] + v["shape"] * dt
+
     return mu
 
 
@@ -57,6 +60,8 @@ def sde_step_dict(
     """
     mu = sde_mu_dict(x_t, v, t, dt, sigma)
     x_new = {k: mu[k] + sigma * (dt ** 0.5) * epsilon[k] for k in mu}
-    x_new["shape"] = x_t["shape"] + v["shape"] * dt  # shape modality has no noise
+    
+    x_new["shape"] = mu["shape"] 
 
     return mu, x_new
+    

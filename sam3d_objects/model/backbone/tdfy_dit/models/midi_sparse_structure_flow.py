@@ -192,6 +192,8 @@ class MidiSparseStructureFlowModel(nn.Module):
         d: torch.Tensor = None,
     ) -> torch.Tensor:
         t_emb = self.t_embedder(t)
+        # print(f't: {(t / 1000).item()}')
+        # print(f'd: {(d / 1000).item()}')
         if d is not None:
             d_emb = self.d_embedder(d)
             t_emb = t_emb + d_emb

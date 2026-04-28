@@ -410,6 +410,7 @@ class FoundationPoseDataset(Dataset):
 
         # Pure rotation: normalize each column
         R = RS / scale[np.newaxis, :]
+        R = R @ np.diag([1, 1, -1])  # Convert from OpenGL to PyTorch3D convention by flipping Z
 
         # 6D rotation = column 0 then column 1 of R (Zhou et al.)
         rotation_6d = np.concatenate([R[:, 0], R[:, 1]]).astype(np.float32)  # [6]
@@ -497,7 +498,7 @@ class FoundationPoseDataset(Dataset):
 
             if dataset_type == 'gso' and self.gso_root is not None:
                 # Load precomputed latent from npy file
-                latent_path = self.gso_root / 'latent_codes' / f'{obj_name}.npy'
+                latent_path = self.gso_root.parent.parent / 'latent_codes' / f'{obj_name}.npy'
                 if latent_path.exists():
                     try:
                         # Load latent: shape (1, 8, 16, 16, 16)
@@ -590,6 +591,8 @@ class FoundationPoseDataset(Dataset):
         mesh_available_list = []
         mesh_bbox_min_list = []
         mesh_bbox_max_list = []
+        mesh_verts_list = []  # raw mesh vertices per object (list of tensors, varying sizes)
+        mesh_faces_list = []  # raw mesh faces per object (list of tensors, varying sizes)
 
         for obj_name in visible_objects:
             dataset_type = object_datasets.get(obj_name, 'unknown')
@@ -599,19 +602,23 @@ class FoundationPoseDataset(Dataset):
                 mesh = self._load_gso_mesh(obj_name)
                 if mesh is not None:
                     points = self._sample_mesh_points(mesh, self.mesh_num_samples)
+                    points = points * 0.5  # [-1,1] -> [-0.5, 0.5]
                     mesh_points_list.append(torch.from_numpy(points))
                     mesh_available_list.append(True)
+                    # Store raw geometry (scaled to [-0.5, 0.5]) for debug GLB export
+                    verts_scaled = (mesh.vertices * 0.5).astype(np.float32)
+                    mesh_verts_list.append(torch.from_numpy(verts_scaled))
+                    mesh_faces_list.append(torch.from_numpy(np.asarray(mesh.faces, dtype=np.int64)))
 
-                    # voxelize mesh into [64, 64, 64] grid when points are in [-1, 1] cube
-                    # copilot generate:
+                    # voxelize mesh into [64, 64, 64] grid when points are in [-0.5, 0.5] cube
                     R = 64  # resolution
                     pts = points  # (N,3), float
 
                     # 1) 범위 오차 보정 (약간 벗어난 값 clip)
-                    pts = np.clip(pts, -1.0, 1.0)
+                    pts = np.clip(pts, -0.5, 0.5)
 
-                    # 2) [-1,1] -> [0, R) 연속좌표로 매핑 후 voxel index로 변환
-                    ijk = np.floor((pts + 1.0) * 0.5 * R).astype(np.int64)
+                    # 2) [-0.5,0.5] -> [0, R) 연속좌표로 매핑 후 voxel index로 변환
+                    ijk = np.floor((pts + 0.5) * R).astype(np.int64)
                     ijk = np.clip(ijk, 0, R - 1)  # (N,3), each in [0,63]
 
                     # 3) occupancy 채우기
@@ -619,9 +626,9 @@ class FoundationPoseDataset(Dataset):
                     voxel[ijk[:, 0], ijk[:, 1], ijk[:, 2]] = 1 
                     voxel_list.append(torch.from_numpy(voxel))
 
-                    # Calculate bounding box from mesh vertices
-                    bbox_min = mesh.vertices.min(axis=0).astype(np.float32)
-                    bbox_max = mesh.vertices.max(axis=0).astype(np.float32)
+                    # Calculate bounding box from mesh vertices (scaled to [-0.5, 0.5])
+                    bbox_min = mesh.vertices.min(axis=0).astype(np.float32) * 0.5
+                    bbox_max = mesh.vertices.max(axis=0).astype(np.float32) * 0.5
                     mesh_bbox_min_list.append(torch.from_numpy(bbox_min))
                     mesh_bbox_max_list.append(torch.from_numpy(bbox_max))
                 else:
@@ -630,14 +637,18 @@ class FoundationPoseDataset(Dataset):
                     mesh_available_list.append(False)
                     mesh_bbox_min_list.append(torch.zeros(3))
                     mesh_bbox_max_list.append(torch.zeros(3))
-                    voxel_list.append(torch.zeros(64, 64, 64, dtype=torch.uint8))   
+                    voxel_list.append(torch.zeros(64, 64, 64, dtype=torch.uint8))
+                    mesh_verts_list.append(None)
+                    mesh_faces_list.append(None)
             else:
                 # Non-GSO objects, no mesh available
                 mesh_points_list.append(torch.zeros(self.mesh_num_samples, 3))
                 mesh_available_list.append(False)
                 mesh_bbox_min_list.append(torch.zeros(3))
                 mesh_bbox_max_list.append(torch.zeros(3))
-                voxel_list.append(torch.zeros(64, 64, 64, dtype=torch.uint8))   
+                voxel_list.append(torch.zeros(64, 64, 64, dtype=torch.uint8))
+                mesh_verts_list.append(None)
+                mesh_faces_list.append(None)
 
         return {
             'mesh_points': torch.stack(mesh_points_list, dim=0),  # [num_objects, num_samples, 3]
@@ -645,6 +656,8 @@ class FoundationPoseDataset(Dataset):
             'mesh_bbox_min': torch.stack(mesh_bbox_min_list, dim=0),  # [num_objects, 3]
             'mesh_bbox_max': torch.stack(mesh_bbox_max_list, dim=0),  # [num_objects, 3]
             'voxels': torch.stack(voxel_list, dim=0),  # [num_objects, 64, 64, 64]
+            'mesh_verts': mesh_verts_list,  # list[Tensor(V,3) | None], one per object
+            'mesh_faces': mesh_faces_list,  # list[Tensor(F,3) | None], one per object
         }
 
     def _load_scene_conditionals(

@@ -121,6 +121,7 @@ from flow_grpo import (
     enable_gradient_checkpointing,
     train_epoch_grpo,
 )
+from flow_grpo.trainer import RunningStats
 
 logging.basicConfig(
     level=logging.INFO,
@@ -338,12 +339,19 @@ def main(args):
     start_epoch = 0
     global_step = 0
     best_reward = -float("inf")
+    adv_stats = RunningStats()
 
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         start_epoch = ckpt.get("epoch", 0)
         global_step = ckpt.get("global_step", 0)
         best_reward = ckpt.get("metrics", {}).get("reward_mean", -float("inf"))
+        if "adv_stats" in ckpt:
+            adv_stats.load_state_dict(ckpt["adv_stats"])
+            logger.info(
+                f"Resumed adv_stats: count={adv_stats.count}, "
+                f"mean={adv_stats.mean:.4f}, std={adv_stats.std:.4f}"
+            )
 
         raw_model = unwrap_dist(model)
         current_backbone = raw_model.reverse_fn.backbone
@@ -351,6 +359,10 @@ def main(args):
         base_backbone = current_backbone.base_model.model if isinstance(current_backbone, PeftModel) else current_backbone
         peft_backbone = PeftModel.from_pretrained(base_backbone, args.resume.replace(".pt", "_peft"), device=device)
         raw_model.reverse_fn.backbone = peft_backbone
+
+        # PeftModel.from_pretrained sets requires_grad=False by default (inference mode).
+        # Re-apply freeze so LoRA params are trainable before building optimizer.
+        freeze_non_lora_params(model)
 
         # Recreate optimizer so it tracks the new PEFT backbone's lora params
         param_groups = get_parameter_groups(model, args.learning_rate, args.weight_decay)
@@ -409,6 +421,7 @@ def main(args):
             is_distributed=is_distributed,
             best_reward=best_reward,
             cfg_strength=args.cfg_strength,
+            adv_stats=adv_stats,
         )
         global_step += len(train_loader)
 
@@ -418,19 +431,25 @@ def main(args):
                 f"Epoch {epoch}: loss={epoch_metrics['loss']:.4f}, "
                 f"pg={epoch_metrics['pg_loss']:.4f}, "
                 f"kl={epoch_metrics['kl_loss']:.4f}, "
-                f"reward={epoch_metrics['reward_mean']:.4f}"
+                f"reward={epoch_metrics['reward_mean']:.4f}, "
+                f"adv_global_mean={adv_stats.mean:.4f}, adv_global_std={adv_stats.std:.4f} "
+                f"(n={adv_stats.count})"
             )
             if exp_logger is not None:
                 log_metrics(exp_logger, {
                     "epoch/loss": epoch_metrics["loss"],
                     "epoch/reward_mean": epoch_metrics["reward_mean"],
+                    "epoch/adv_global_mean": adv_stats.mean,
+                    "epoch/adv_global_std": adv_stats.std,
                 }, global_step)
 
+            _adv_extra = {"adv_stats": adv_stats.state_dict()}
             save_checkpoint(
                 model, optimizer, scheduler,
                 epoch, global_step, epoch_metrics,
                 str(output_dir / "latest.pt"),
                 is_distributed,
+                extra_state=_adv_extra,
             )
 
         if args.save_interval_epochs > 0 and (epoch + 1) % args.save_interval_epochs == 0:
@@ -440,6 +459,7 @@ def main(args):
                     epoch, global_step, epoch_metrics,
                     str(output_dir / f"epoch_{epoch:04d}.pt"),
                     is_distributed,
+                    extra_state={"adv_stats": adv_stats.state_dict()},
                 )
 
     logger.info("Flow-GRPO training completed.")
@@ -501,7 +521,7 @@ if __name__ == "__main__":
     parser.add_argument("--image_width", type=int, default=0)
     parser.add_argument("--image_height", type=int, default=0)
     parser.add_argument("--num_renders_per_scene", type=int, default=1)
-    parser.add_argument("--load_meshes", action="store_true")
+    parser.add_argument("--load_meshes", action="store_true", default=True)
 
     # ---- Flow-GRPO-Fast hyperparameters ----
     parser.add_argument("--group_size", type=int, default=8,
