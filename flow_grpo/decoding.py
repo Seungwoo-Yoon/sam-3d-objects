@@ -118,3 +118,75 @@ def decode_shape_to_sdf(
             meshes.append(mesh_outs[j])
 
     return meshes
+
+
+@torch.no_grad()
+def decode_shape_groups_to_sdf(
+    shape_latent: torch.Tensor,     # (G*N, L, 8)
+    ss_decoder: nn.Module,
+    slat_generator: nn.Module,
+    slat_decoder_mesh: nn.Module,
+    cond_embed: torch.Tensor,       # (G*N, L_slat, C_slat)
+    device: torch.device,
+    num_groups: int,
+    num_objects: int,
+) -> List[List]:
+    """Decode multiple GRPO group samples at once and split meshes by group."""
+    total_objects = num_groups * num_objects
+    if shape_latent.shape[0] != total_objects:
+        raise ValueError(
+            f"shape_latent batch ({shape_latent.shape[0]}) does not match "
+            f"num_groups*num_objects ({total_objects})"
+        )
+    if cond_embed.shape[0] != total_objects:
+        raise ValueError(
+            f"cond_embed batch ({cond_embed.shape[0]}) does not match "
+            f"num_groups*num_objects ({total_objects})"
+        )
+
+    # 1. ss_decoder -> voxel -> coords for all group/object entries.
+    ss_vol = ss_decoder(
+        shape_latent.permute(0, 2, 1)
+        .contiguous()
+        .view(total_objects, 8, 16, 16, 16)
+    )
+    coords = torch.argwhere(ss_vol > 0)[:, [0, 2, 3, 4]].int()
+
+    if coords.shape[0] == 0:
+        return [[] for _ in range(num_groups)]
+
+    group_has_coords = torch.zeros(num_groups, device=coords.device, dtype=torch.bool)
+    group_ids = (coords[:, 0].long() // num_objects).clamp(max=num_groups - 1)
+    group_has_coords[group_ids] = True
+
+    # Decode the whole group/object chunk at once. The caller controls this
+    # granularity with decode_batch_size, so do not re-chunk here.
+    batch_coords_local = prune_sparse_structure(coords.clone())
+    batch_coords_local, _ = downsample_sparse_structure(batch_coords_local)
+
+    if batch_coords_local.shape[0] == 0:
+        meshes_flat = [None] * total_objects
+    else:
+        latent_shape = (1, batch_coords_local.shape[0], 8)
+        coords_np = batch_coords_local.cpu().numpy()
+        slat = slat_generator(latent_shape, device, cond_embed, coords_np)
+        slat = sp.SparseTensor(
+            coords=batch_coords_local,
+            feats=slat[0],
+        ).to(device)
+        slat = slat * SLAT_STD.to(device) + SLAT_MEAN.to(device)
+        meshes_flat = list(slat_decoder_mesh(slat))
+        if len(meshes_flat) < total_objects:
+            meshes_flat.extend([None] * (total_objects - len(meshes_flat)))
+
+    mesh_groups = []
+    for group_idx in range(num_groups):
+        start = group_idx * num_objects
+        end = start + num_objects
+        if not bool(group_has_coords[group_idx].item()):
+            # Preserve decode_shape_to_sdf semantics for an empty sample.
+            mesh_groups.append([])
+        else:
+            mesh_groups.append(meshes_flat[start:end])
+
+    return mesh_groups

@@ -15,7 +15,7 @@ from sam3d_objects.model.backbone.tdfy_dit.models.dual_backbone_checkpoint_utils
 
 from peft.peft_model import PeftModel
 
-POINTMAP = True
+POINTMAP = False
 PATH = os.getcwd()
 TAG = "hf"
 config_path = f"{PATH}/../checkpoints/{TAG}/pipeline_original.yaml"
@@ -61,7 +61,7 @@ base_backbone = inference._pipeline.models["ss_generator"].reverse_fn.backbone
 
 backbone1 = PeftModel.from_pretrained(
     copy.deepcopy(base_backbone),
-    f"{PATH}/../outputs/flow_grpo_mesh_intersection3/step_00000480_peft",
+    f"{PATH}/../outputs/flow_grpo_mesh_intersection3/step_00002010_peft",
     device_map="auto",
 )
 
@@ -81,7 +81,7 @@ inference._pipeline.models["ss_generator"].reverse_fn.backbone = backbone1
 
 # inference._pipeline.models["ss_generator"].reverse_fn.strength = 0.0
 
-IMAGE_PATH = f"{PATH}/images/segment1/image.jpg"
+IMAGE_PATH = f"{PATH}/images/segment4/image.png"
 IMAGE_NAME = os.path.basename(os.path.dirname(IMAGE_PATH))
 
 image = load_image(IMAGE_PATH)

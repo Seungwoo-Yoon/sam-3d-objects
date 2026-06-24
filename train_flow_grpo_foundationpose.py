@@ -385,6 +385,8 @@ def main(args):
     logger.info(
         f"Starting Flow-GRPO-Fast: {args.num_epochs} epochs, "
         f"G={args.group_size}, T_train={args.t_train_steps}, T_sde={args.t_sde_steps}, "
+        f"generation_batch_size={args.generation_batch_size}, "
+        f"decode_batch_size={args.decode_batch_size}, "
         f"sde_a={args.sde_a}, kl_coeff={args.kl_coeff}"
     )
 
@@ -421,6 +423,8 @@ def main(args):
             is_distributed=is_distributed,
             best_reward=best_reward,
             cfg_strength=args.cfg_strength,
+            generation_batch_size=args.generation_batch_size,
+            decode_batch_size=args.decode_batch_size,
             adv_stats=adv_stats,
         )
         global_step += len(train_loader)
@@ -546,6 +550,14 @@ if __name__ == "__main__":
                         help="Enable gradient checkpointing on transformer blocks. "
                              "Reduces peak activation memory during backward at the cost "
                              "of ~2x more compute (activations are recomputed on backward).")
+    parser.add_argument("--generation_batch_size", type=int, default=0,
+                        help="Number of GRPO group trajectories to concatenate during "
+                             "generation. 0 means all groups; 1 matches the old serial "
+                             "group execution with the same sample count.")
+    parser.add_argument("--decode_batch_size", type=int, default=1,
+                        help="Number of GRPO group samples to concatenate during "
+                             "shape-to-SDF decoding. 1 matches the old serial decode; "
+                             "0 means all groups with the same sample count.")
 
     # ---- Optimizer ----
     parser.add_argument("--num_epochs", type=int, default=50)

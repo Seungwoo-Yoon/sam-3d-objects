@@ -11,6 +11,7 @@ import numpy as np
 from sam3d_objects.model.backbone.tdfy_dit.representations.mesh.cube2mesh import MeshExtractResult
 
 THRESHOLD_GT_COVERAGE = -0.01  # hyperparameter: objects with GT coverage below this get all other rewards masked out to zero
+COLLISION_TOLERANCE = 0.99     # shrink meshes slightly to avoid false positives
 
 def extract_sdf_surface(sdf: torch.Tensor, res: int, dtype: torch.dtype) -> torch.Tensor | None:
     """
@@ -292,6 +293,7 @@ def object_intersection_reward_binary(
     if len(valid) < 2:
         return torch.ones(N, device=pose_device)
 
+    scale = scale * COLLISION_TOLERANCE  # shrink meshes slightly to avoid false positives
     R_map = {vi: quaternion_to_matrix(rotation[vi, 0:1])[0] for vi, _ in valid}
 
     # ── Step 1: compute world-space AABB for each mesh ───────────────────────
@@ -451,6 +453,7 @@ def ground_penetration_reward_binary(
 
     cam_to_world = torch.linalg.inv(camera_transform.to(device=device, dtype=dtype))  # (4, 4)
 
+    scale = scale * COLLISION_TOLERANCE  # shrink meshes slightly to avoid false positives
     R_map = {vi: quaternion_to_matrix(rotation[vi, 0:1])[0].to(device=device, dtype=dtype) for vi, _ in valid}
     s_map = {vi: scale[vi, 0].to(device=device, dtype=dtype)       for vi, _ in valid}
     t_map = {vi: translation[vi, 0].to(device=device, dtype=dtype) for vi, _ in valid}
@@ -788,6 +791,23 @@ def pointmap_coverage_reward(
 
     return -penalties.to(pose_device)
 
+def scale_reward(
+    pred_scale: torch.Tensor,
+    gt_scale: torch.Tensor,
+):
+    """
+    Reward based on the difference between predicted and ground truth log scale.
+
+    Args:
+        pred_scale: (N, 1, 3) predicted per-object scale
+        gt_scale:   (N, 3)    ground truth scale
+    """
+    pred_scale_log = torch.log(pred_scale.squeeze(1) + 1e-6)
+    gt_scale_log = torch.log(gt_scale + 1e-6)
+    scale_diff_log = (pred_scale_log - gt_scale_log) ** 2  #(N, 3)
+
+    scale_reward = -scale_diff_log.mean(dim=-1)  # (N,)
+    return scale_reward
 
 def compute_reward(
     meshes: List[MeshExtractResult],
@@ -808,6 +828,7 @@ def compute_reward(
         #"ground_penetration": ground_penetration_reward(meshes, scale, rotation, translation, camera_transform),
         "collision": object_intersection_reward_binary(meshes, scale, rotation, translation) + ground_penetration_reward_binary(meshes, scale, rotation, translation, camera_transform),
         # "pointmap_coverage": pointmap_coverage_reward(meshes, scale, rotation, translation, pointmap, masks),
+        "scale": scale_reward(scale, gt_scale) if gt_scale is not None else torch.zeros(len(meshes), device=scale.device),
     }
 
     gt_available = (
@@ -827,7 +848,7 @@ def compute_reward(
         # print(result["gt_coverage"])
 
         for k in result:
-            if k != "gt_coverage":
+            if k != "gt_coverage" and k != "scale":
                 result[k] = result[k] * (result["gt_coverage"] > THRESHOLD_GT_COVERAGE).float()  # mask out rewards when GT coverage is very poor (threshold is a hyperparameter)
 
     return result

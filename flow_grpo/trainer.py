@@ -59,7 +59,7 @@ from train_dual_backbone_foundationpose import (
 from train_midi_lora_foundationpose import save_checkpoint
 
 from .generation import generate_sde_group
-from .decoding import decode_shape_to_sdf
+from .decoding import decode_shape_groups_to_sdf
 from .reward import compute_reward
 from .loss import compute_grpo_loss_single
 
@@ -95,6 +95,8 @@ def train_epoch_grpo(
     is_distributed: bool = False,
     best_reward: float = -float("inf"),
     cfg_strength: float = 7.0,
+    generation_batch_size: int = 0,
+    decode_batch_size: int = 1,
     adv_stats: Optional[RunningStats] = None,
 ) -> Tuple[Dict[str, float], float]:
     """GRPO training epoch."""
@@ -179,177 +181,87 @@ def train_epoch_grpo(
                 sde_a=sde_a,
                 cfg_strength=cfg_strength,
                 time_scale=raw_model.time_scale,
+                generation_batch_size=generation_batch_size,
             )
 
             # -------------------------------------------------------------
             # Decode final samples and compute rewards
             # -------------------------------------------------------------
             all_reward_dicts = []   # one per trajectory, None for failures
-            for g_idx, traj in enumerate(trajectories):
-                x_1 = traj["x_steps"][-1]   # final latent dict
-                shape_latent = x_1["shape"]   # (N_obj, L, 8)
+            decode_group_batch_size = (
+                len(trajectories) if decode_batch_size <= 0
+                else min(decode_batch_size, len(trajectories))
+            )
 
-                scale = torch.zeros((scene_num_objects, 1, 3), device=device)
-                rotation = torch.zeros((scene_num_objects, 1, 4), device=device)
-                translation = torch.zeros((scene_num_objects, 1, 3), device=device)
+            for decode_start in range(0, len(trajectories), decode_group_batch_size):
+                chunk_trajs = trajectories[decode_start:decode_start + decode_group_batch_size]
+                chunk_size = len(chunk_trajs)
 
-                for i, ss_input_dict in enumerate(ss_input_dicts):
-                    pose = pose_decoder({
-                        "shape": shape_latent[i:i+1],
-                        "scale": x_1["scale"][i:i+1],
-                        "6drotation_normalized": x_1["6drotation_normalized"][i:i+1],
-                        "translation": x_1["translation"][i:i+1],
-                        "translation_scale": x_1["translation_scale"],
-                    }, scene_scale=ss_input_dict['pointmap_scale'], scene_shift=ss_input_dict['pointmap_shift'])
+                shape_latent_batch = torch.cat([
+                    traj["x_steps"][-1]["shape"] for traj in chunk_trajs
+                ], dim=0)
+                slat_cond_embed_batch = slat_cond_embed.repeat(chunk_size, 1, 1)
 
-                    scale[i:i+1] = pose["scale"]
-                    rotation[i:i+1] = pose["rotation"]
-                    translation[i:i+1] = pose["translation"]
-
-                meshes = decode_shape_to_sdf(
-                    shape_latent=shape_latent,
+                mesh_groups = decode_shape_groups_to_sdf(
+                    shape_latent=shape_latent_batch,
                     ss_decoder=ss_decoder,
                     slat_generator=slat_generator,
                     slat_decoder_mesh=slat_decoder_mesh,
-                    cond_embed=slat_cond_embed,
+                    cond_embed=slat_cond_embed_batch,
                     device=device,
+                    num_groups=chunk_size,
+                    num_objects=scene_num_objects,
                 )
 
-                # [DEBUG] Output combined mesh (Only for the first trajectory)
-                # Also save the input image for reference
-                # if g_idx == 0 and rank == 0 and output_dir is not None and len(meshes) > 0:
-                #     try:
-                #         debug_dir = output_dir / "debug"
-                #         debug_dir.mkdir(parents=True, exist_ok=True)
-                #         tag = f"step{global_step + step:06d}"
+                for local_g, (traj, meshes) in enumerate(zip(chunk_trajs, mesh_groups)):
+                    x_1 = traj["x_steps"][-1]   # final latent dict
+                    shape_latent = x_1["shape"]   # (N_obj, L, 8)
 
-                #         # Build per-object trimesh and apply predicted pose transform
-                #         combined_meshes = []
-                #         for obj_idx, m in enumerate(meshes):
-                #             if m is None or not m.success:
-                #                 continue
-                #             verts = m.vertices.detach().cpu().float().numpy()
-                #             faces = m.faces.detach().cpu().numpy()
-                #             tri = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+                    scale = torch.zeros((scene_num_objects, 1, 3), device=device)
+                    rotation = torch.zeros((scene_num_objects, 1, 4), device=device)
+                    translation = torch.zeros((scene_num_objects, 1, 3), device=device)
 
-                #             s = scale[obj_idx, 0].detach().cpu().float().numpy()       # (3,)
-                #             q = rotation[obj_idx, 0].detach().cpu().float()             # (4,) [w,x,y,z]
-                #             t = translation[obj_idx, 0].detach().cpu().float().numpy()  # (3,)
+                    for i, ss_input_dict in enumerate(ss_input_dicts):
+                        pose = pose_decoder({
+                            "shape": shape_latent[i:i+1],
+                            "scale": x_1["scale"][i:i+1],
+                            "6drotation_normalized": x_1["6drotation_normalized"][i:i+1],
+                            "translation": x_1["translation"][i:i+1],
+                            "translation_scale": x_1["translation_scale"],
+                        }, scene_scale=ss_input_dict['pointmap_scale'], scene_shift=ss_input_dict['pointmap_shift'])
 
-                #             R = quaternion_to_matrix(q).numpy()  # (3, 3)
-                #             M = np.eye(4)
-                #             M[:3, :3] = R @ np.diag([1, 1, 1]) @ np.diag(s)
-                #             M[:3, 3] = t
-                #             tri.apply_transform(M)
-                #             combined_meshes.append(tri)
+                        scale[i:i+1] = pose["scale"]
+                        rotation[i:i+1] = pose["rotation"]
+                        translation[i:i+1] = pose["translation"]
 
-                #         if combined_meshes:
-                #             combined = trimesh.util.concatenate(combined_meshes)
-                #             combined.export(str(debug_dir / f"{tag}_combined.glb"))
+                    if len(meshes) == 0:
+                        all_reward_dicts.append(None)   # penalty for empty structure
+                    else:
+                        try:
+                            reward_dict = compute_reward(
+                                meshes, scale, rotation, translation,
+                                conditionals["camera_view_transform"],
+                                conditionals["pointmap"], conditionals["object_masks"],
+                                gt_mesh_points=gt_mesh_data["mesh_points"]    if gt_mesh_data is not None else None,
+                                gt_scale=gt_latents.get("scale"),
+                                gt_rotation_6d=gt_latents.get("6drotation_normalized"),
+                                gt_translation=gt_latents.get("translation"),
+                                gt_mesh_available=gt_mesh_data["mesh_available"] if gt_mesh_data is not None else None,
+                            )
+                        except NotImplementedError:
+                            raise
+                        except Exception as e:
+                            logger.warning(f"Reward computation failed: {e}")
+                            reward_dict = None
+                        all_reward_dicts.append(reward_dict)
 
-                #         # Save GT meshes in camera space as GLB (one per object + combined)
-                #         if (
-                #             gt_mesh_data is not None
-                #             and gt_mesh_data.get("mesh_verts") is not None
-                #             and gt_latents.get("scale") is not None
-                #             and gt_latents.get("6drotation_normalized") is not None
-                #             and gt_latents.get("translation") is not None
-                #         ):
-                #             gt_verts_list = gt_mesh_data["mesh_verts"]   # list[Tensor(V,3)|None]
-                #             gt_faces_list = gt_mesh_data["mesh_faces"]   # list[Tensor(F,3)|None]
-                #             gt_avail      = gt_mesh_data["mesh_available"].cpu().numpy()
-                #             gt_s   = gt_latents["scale"].float().cpu().numpy()                  # (N, 3)
-                #             gt_r6d = gt_latents["6drotation_normalized"].float()                # (N, 6)
-                #             gt_t   = gt_latents["translation"].float().cpu().numpy()            # (N, 3)
+                    # Free SDF grids — only needed for reward, not for GRPO loss
+                    for m in meshes:
+                        if m is not None:
+                            m.sdf_d = None
+                    del meshes
 
-                #             # 6D rotation → matrix  (Zhou et al., 2019)
-                #             a1 = torch.nn.functional.normalize(gt_r6d[:, :3], dim=-1)
-                #             a2 = gt_r6d[:, 3:6]
-                #             a2 = torch.nn.functional.normalize(
-                #                 a2 - (a2 * a1).sum(-1, keepdim=True) * a1, dim=-1
-                #             )
-                #             a3 = torch.linalg.cross(a1, a2)
-                #             R_gt = torch.stack([a1, a2, a3], dim=-1).cpu().numpy()  # (N, 3, 3)
-
-                #             gt_tris = []
-                #             for obj_idx, (verts_t, faces_t) in enumerate(
-                #                 zip(gt_verts_list, gt_faces_list)
-                #             ):
-                #                 if not gt_avail[obj_idx] or verts_t is None or faces_t is None:
-                #                     continue
-                #                 verts = verts_t.cpu().float().numpy()  # (V, 3) in [-0.5, 0.5]
-                #                 faces = faces_t.cpu().numpy()
-                #                 # Apply GT pose: pts_cam = (verts * s) @ R^T + t
-                #                 M = np.eye(4)
-                #                 M[:3, :3] = R_gt[obj_idx] @ np.diag(gt_s[obj_idx])
-                #                 M[:3, 3]  = gt_t[obj_idx]
-                #                 tri = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-                #                 tri.apply_transform(M)
-                #                 # tri.export(str(debug_dir / f"{tag}_gt_obj{obj_idx}.glb"))
-                #                 gt_tris.append(tri)
-
-                #             if gt_tris:
-                #                 trimesh.util.concatenate(gt_tris).export(
-                #                     str(debug_dir / f"{tag}_gt_combined.glb")
-                #                 )
-
-                #         # Save input image with per-object mask overlay
-                #         img_tensor = conditionals["image"]  # [H, W, 3]
-                #         img_np = img_tensor.detach().cpu().numpy()
-                #         if img_np.dtype != np.uint8:
-                #             img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
-                #         vis = img_np.astype(np.float32)
-                #         if "object_masks" in conditionals:
-                #             masks_np = conditionals["object_masks"].detach().cpu().numpy()  # (N, H, W)
-                #             _COLORS = [
-                #                 (255,  60,  60),
-                #                 ( 60, 200,  60),
-                #                 ( 60, 120, 255),
-                #                 (255, 200,  40),
-                #                 (200,  60, 255),
-                #                 ( 40, 220, 220),
-                #             ]
-                #             for obj_idx, mask in enumerate(masks_np):
-                #                 color = _COLORS[obj_idx % len(_COLORS)]
-                #                 alpha = 0.45
-                #                 for c in range(3):
-                #                     vis[:, :, c] = np.where(
-                #                         mask > 0.5,
-                #                         vis[:, :, c] * (1 - alpha) + color[c] * alpha,
-                #                         vis[:, :, c],
-                #                     )
-                #         Image.fromarray(vis.clip(0, 255).astype(np.uint8)).save(
-                #             str(debug_dir / f"{tag}_input.png")
-                #         )
-                #     except Exception as _dbg_e:
-                #         logger.warning(f"[DEBUG] mesh/image save failed: {_dbg_e}")
-
-                if len(meshes) == 0:
-                    all_reward_dicts.append(None)   # penalty for empty structure
-                else:
-                    try:
-                        reward_dict = compute_reward(
-                            meshes, scale, rotation, translation,
-                            conditionals["camera_view_transform"],
-                            conditionals["pointmap"], conditionals["object_masks"],
-                            gt_mesh_points=gt_mesh_data["mesh_points"]    if gt_mesh_data is not None else None,
-                            gt_scale=gt_latents.get("scale"),
-                            gt_rotation_6d=gt_latents.get("6drotation_normalized"),
-                            gt_translation=gt_latents.get("translation"),
-                            gt_mesh_available=gt_mesh_data["mesh_available"] if gt_mesh_data is not None else None,
-                        )
-                    except NotImplementedError:
-                        raise
-                    except Exception as e:
-                        logger.warning(f"Reward computation failed: {e}")
-                        reward_dict = None
-                    all_reward_dicts.append(reward_dict)
-
-                # Free SDF grids — only needed for reward, not for GRPO loss
-                for m in meshes:
-                    if m is not None:
-                        m.sdf_d = None
-                del meshes
+                del mesh_groups
                 torch.cuda.empty_cache()
 
             n_valid = sum(1 for rd in all_reward_dicts if rd is not None)

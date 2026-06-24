@@ -24,6 +24,7 @@ def generate_sde_group(
     sde_a: float = 0.7,
     cfg_strength: float = 7.0,
     time_scale: float = 1000.0,
+    generation_batch_size: int = 0,
 ) -> Tuple[List[Dict], List[int]]:
     """
     Flow-GRPO-Fast: T_sde steps randomly sampled (without replacement) from
@@ -40,6 +41,9 @@ def generate_sde_group(
       dt_steps    : list of T_sde floats
 
     compute_grpo_loss_single uses x_steps[2*i] and x_steps[2*i+1] for SDE step i.
+
+    generation_batch_size controls how many group trajectories are concatenated
+    into one backbone forward. 0 means all G groups; 1 is the old serial layout.
 
     Returns:
       trajectories   : list of G trajectory dicts (described above)
@@ -65,60 +69,112 @@ def generate_sde_group(
     # Pick one component to perturb with noise; all G share the same choice
     noisy_key = str(np.random.choice(["6drotation_normalized", "translation", "scale"]))
 
+    num_objects = next(iter(latent_shape_dict.values()))[0]
+    group_batch_size = G if generation_batch_size <= 0 else min(generation_batch_size, G)
+
+    def _cat_dicts(dicts: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        return {k: torch.cat([d[k] for d in dicts], dim=0) for k in dicts[0]}
+
+    def _slice_group(d: Dict[str, torch.Tensor], local_g: int) -> Dict[str, torch.Tensor]:
+        start = local_g * num_objects
+        end = start + num_objects
+        return {k: v[start:end].detach() for k, v in d.items()}
+
     trajectories = []
-    for g in range(G):
-        x_t = model._generate_noise(latent_shape_dict, device)
+    for group_start in range(0, G, group_batch_size):
+        group_end = min(group_start + group_batch_size, G)
+        group_indices = list(range(group_start, group_end))
+        chunk_size = len(group_indices)
 
-        # x_steps stores interleaved (x_in, x_out) for each SDE step + x_final
-        x_steps: List[Dict] = []
-        mu_steps, sigma_steps, t_steps, dt_steps = [], [], [], []
+        # Preserve the original per-group RNG order: initial noise first, then
+        # the SDE-window noise tensors for that group.
+        x0_list = []
+        eps_noisy_by_group = []
+        for _g in group_indices:
+            x0 = model._generate_noise(latent_shape_dict, device)
+            x0_list.append(x0)
+            eps_noisy_by_group.append([
+                torch.randn_like(x0[noisy_key])
+                for _ in range(T_sde)
+            ])
 
+        x_t = _cat_dicts(x0_list)
+        cond_embed_batch = cond_embed.repeat(chunk_size, 1, 1)
+
+        chunk_x_steps: List[List[Dict]] = [[] for _ in group_indices]
+        chunk_mu_steps: List[List[Dict]] = [[] for _ in group_indices]
+        chunk_sigma_steps: List[List[float]] = [[] for _ in group_indices]
+        chunk_t_steps: List[List[float]] = [[] for _ in group_indices]
+        chunk_dt_steps: List[List[float]] = [[] for _ in group_indices]
+
+        sde_pos = 0
         for step_idx in range(T_train):
-            t  = float(t_seq[step_idx])
+            t = float(t_seq[step_idx])
             dt = float(t_seq[step_idx + 1]) - t
 
+            # Keep the original singleton timestep/delta semantics. The model
+            # broadcasts these across all objects/groups, matching the old serial
+            # generation path more closely than per-row repeated tensors.
             t_tensor = torch.tensor([t * time_scale], device=device, dtype=torch.float32)
-            # d_tensor = torch.zeros(1, device=device, dtype=torch.float32)
             d_tensor = torch.tensor([dt * time_scale], device=device, dtype=torch.float32)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                v = model.reverse_fn.backbone(x_t, t_tensor, cond_embed, d=d_tensor)
+                v = model.reverse_fn.backbone(x_t, t_tensor, cond_embed_batch, d=d_tensor)
 
             if step_idx in sde_index_set:
-                # SDE step: inject noise only on noisy_key; others get zeros → ODE
-                # g==0 is fixed as ODE (sigma=0 → no noise injected)
-                sigma = 0.0 if g < G // 4 or g == 0 else sde_sigma(t, a=sde_a)
-                eps   = {
-                    k: (torch.randn_like(x_t[k]) if k == noisy_key else torch.zeros_like(x_t[k]))
-                    for k in x_t
-                }
-                mu, x_new = sde_step_dict(x_t, v, t, dt, sigma, eps)
+                # SDE step: inject noise only on noisy_key; others get zeros -> ODE.
+                # Keep the same per-group sigma rule as the serial implementation.
+                sigma_values = [
+                    0.0 if g < G // 4 or g == 0 else sde_sigma(t, a=sde_a)
+                    for g in group_indices
+                ]
 
-                x_steps.append({k: x_t[k].detach() for k in x_t})       # x_in
-                x_steps.append({k: x_new[k].detach() for k in x_new})   # x_out
+                # Keep backbone evaluation batched, but apply the SDE update one
+                # group at a time. This matches the old serial path where each
+                # sde_step_dict call sees all objects for one trajectory.
+                mu_groups = []
+                x_new_groups = []
+                for local_g, sigma in enumerate(sigma_values):
+                    x_group = _slice_group(x_t, local_g)
+                    v_group = _slice_group(v, local_g)
+                    eps_group = {k: torch.zeros_like(val) for k, val in x_group.items()}
+                    eps_group[noisy_key] = eps_noisy_by_group[local_g][sde_pos]
 
-                mu_steps.append({k: mu[k].detach() for k in mu})
-                sigma_steps.append(sigma)
-                t_steps.append(t)
-                dt_steps.append(dt)
+                    mu_group, x_new_group = sde_step_dict(
+                        x_group, v_group, t, dt, sigma, eps_group
+                    )
+                    mu_groups.append(mu_group)
+                    x_new_groups.append(x_new_group)
+
+                mu = _cat_dicts(mu_groups)
+                x_new = _cat_dicts(x_new_groups)
+
+                for local_g, sigma in enumerate(sigma_values):
+                    chunk_x_steps[local_g].append(_slice_group(x_t, local_g))       # x_in
+                    chunk_x_steps[local_g].append(_slice_group(x_new, local_g))     # x_out
+                    chunk_mu_steps[local_g].append(_slice_group(mu, local_g))
+                    chunk_sigma_steps[local_g].append(sigma)
+                    chunk_t_steps[local_g].append(t)
+                    chunk_dt_steps[local_g].append(dt)
+
+                sde_pos += 1
             else:
                 # ODE step: deterministic update, not stored
                 x_new = {k: (x_t[k] + v[k] * dt).detach() for k in x_t}
 
             x_t = x_new
 
-        # Append x_final (= x_1) for reward decoding
-        x_steps.append({k: v.detach() for k, v in x_t.items()})
-
-        trajectories.append(
-            dict(
-                x_steps=x_steps,
-                mu_steps=mu_steps,
-                sigma_steps=sigma_steps,
-                t_steps=t_steps,
-                dt_steps=dt_steps,
-                noisy_key=noisy_key,
+        for local_g in range(chunk_size):
+            chunk_x_steps[local_g].append(_slice_group(x_t, local_g))  # x_final
+            trajectories.append(
+                dict(
+                    x_steps=chunk_x_steps[local_g],
+                    mu_steps=chunk_mu_steps[local_g],
+                    sigma_steps=chunk_sigma_steps[local_g],
+                    t_steps=chunk_t_steps[local_g],
+                    dt_steps=chunk_dt_steps[local_g],
+                    noisy_key=noisy_key,
+                )
             )
-        )
 
     return trajectories, sde_indices_sorted
