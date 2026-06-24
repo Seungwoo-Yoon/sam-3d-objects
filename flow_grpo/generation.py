@@ -18,6 +18,7 @@ def generate_sde_group(
     cond_embed: torch.Tensor,   # pre-computed condition embedding  (N, L, C)
     latent_shape_dict: Dict,    # {latent_name: (N, seq_len, channels)}
     device: torch.device,
+    gt_shape_latents: torch.Tensor,  # (N, 16x16x16, 8)
     G: int = 8,
     T_train: int = 10,
     T_sde: int = 2,
@@ -44,6 +45,8 @@ def generate_sde_group(
 
     generation_batch_size controls how many group trajectories are concatenated
     into one backbone forward. 0 means all G groups; 1 is the old serial layout.
+    The shape latent is anchored to GT during generation: each step receives the
+    noised GT shape for that timestep, and the final shape is the GT shape.
 
     Returns:
       trajectories   : list of G trajectory dicts (described above)
@@ -70,6 +73,17 @@ def generate_sde_group(
     noisy_key = str(np.random.choice(["6drotation_normalized", "translation", "scale"]))
 
     num_objects = next(iter(latent_shape_dict.values()))[0]
+    if "shape" not in latent_shape_dict:
+        raise KeyError("latent_shape_dict must contain a 'shape' entry")
+    if gt_shape_latents is None:
+        raise ValueError("gt_shape_latents is required to keep shape fixed to GT")
+    if tuple(gt_shape_latents.shape) != tuple(latent_shape_dict["shape"]):
+        raise ValueError(
+            f"gt_shape_latents shape {tuple(gt_shape_latents.shape)} does not match "
+            f"latent_shape_dict['shape'] {tuple(latent_shape_dict['shape'])}"
+        )
+    gt_shape_latents = gt_shape_latents.to(device=device)
+    sigma_min = float(getattr(model, "sigma_min", 0.0))
     group_batch_size = G if generation_batch_size <= 0 else min(generation_batch_size, G)
 
     def _cat_dicts(dicts: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -89,9 +103,11 @@ def generate_sde_group(
         # Preserve the original per-group RNG order: initial noise first, then
         # the SDE-window noise tensors for that group.
         x0_list = []
+        shape_noise_list = []
         eps_noisy_by_group = []
         for _g in group_indices:
             x0 = model._generate_noise(latent_shape_dict, device)
+            shape_noise_list.append(x0["shape"].detach())
             x0_list.append(x0)
             eps_noisy_by_group.append([
                 torch.randn_like(x0[noisy_key])
@@ -99,6 +115,17 @@ def generate_sde_group(
             ])
 
         x_t = _cat_dicts(x0_list)
+        shape_noise_batch = torch.cat(shape_noise_list, dim=0)
+        gt_shape_batch = gt_shape_latents.to(dtype=shape_noise_batch.dtype).repeat(
+            chunk_size, *([1] * (gt_shape_latents.ndim - 1))
+        )
+
+        def _shape_at_t(t_value: float) -> torch.Tensor:
+            if t_value >= 1.0:
+                return gt_shape_batch
+            return (1.0 - (1.0 - sigma_min) * t_value) * shape_noise_batch + t_value * gt_shape_batch
+
+        x_t["shape"] = _shape_at_t(float(t_seq[0])).detach()
         cond_embed_batch = cond_embed.repeat(chunk_size, 1, 1)
 
         chunk_x_steps: List[List[Dict]] = [[] for _ in group_indices]
@@ -111,6 +138,8 @@ def generate_sde_group(
         for step_idx in range(T_train):
             t = float(t_seq[step_idx])
             dt = float(t_seq[step_idx + 1]) - t
+            next_t = float(t_seq[step_idx + 1])
+            x_t["shape"] = _shape_at_t(t).detach()
 
             # Keep the original singleton timestep/delta semantics. The model
             # broadcasts these across all objects/groups, matching the old serial
@@ -148,6 +177,9 @@ def generate_sde_group(
 
                 mu = _cat_dicts(mu_groups)
                 x_new = _cat_dicts(x_new_groups)
+                shape_next = _shape_at_t(next_t).detach()
+                mu["shape"] = shape_next
+                x_new["shape"] = shape_next
 
                 for local_g, sigma in enumerate(sigma_values):
                     chunk_x_steps[local_g].append(_slice_group(x_t, local_g))       # x_in
@@ -161,6 +193,7 @@ def generate_sde_group(
             else:
                 # ODE step: deterministic update, not stored
                 x_new = {k: (x_t[k] + v[k] * dt).detach() for k in x_t}
+                x_new["shape"] = _shape_at_t(next_t).detach()
 
             x_t = x_new
 

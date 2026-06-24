@@ -287,7 +287,7 @@ def main(args):
         load_depth=True,
         load_masks=True,
         image_size=(args.image_height, args.image_width) if args.image_width > 0 else None,
-        precomputed_latents=False,   # GRPO needs raw images for decoding
+        precomputed_latents=True,   # GRPO needs raw images for decoding
         num_renders_per_scene=args.num_renders_per_scene,
         gso_root=args.gso_root or None,
         load_meshes=args.load_meshes,
@@ -386,7 +386,6 @@ def main(args):
         f"Starting Flow-GRPO-Fast: {args.num_epochs} epochs, "
         f"G={args.group_size}, T_train={args.t_train_steps}, T_sde={args.t_sde_steps}, "
         f"generation_batch_size={args.generation_batch_size}, "
-        f"decode_batch_size={args.decode_batch_size}, "
         f"sde_a={args.sde_a}, kl_coeff={args.kl_coeff}"
     )
 
@@ -556,8 +555,8 @@ if __name__ == "__main__":
                              "group execution with the same sample count.")
     parser.add_argument("--decode_batch_size", type=int, default=1,
                         help="Number of GRPO group samples to concatenate during "
-                             "shape-to-SDF decoding. 1 matches the old serial decode; "
-                             "0 means all groups with the same sample count.")
+                             "shape-to-SDF decoding. Retained for compatibility; "
+                             "ignored when trainer uses GT meshes for reward.")
 
     # ---- Optimizer ----
     parser.add_argument("--num_epochs", type=int, default=50)

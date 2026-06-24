@@ -10,7 +10,7 @@ import numpy as np
 
 from sam3d_objects.model.backbone.tdfy_dit.representations.mesh.cube2mesh import MeshExtractResult
 
-THRESHOLD_GT_COVERAGE = -0.01  # hyperparameter: objects with GT coverage below this get all other rewards masked out to zero
+THRESHOLD_SFT = -0.5           # hyperparameter: objects with SFT below this get all other rewards masked out to zero
 COLLISION_TOLERANCE = 0.99     # shrink meshes slightly to avoid false positives
 
 def extract_sdf_surface(sdf: torch.Tensor, res: int, dtype: torch.dtype) -> torch.Tensor | None:
@@ -791,6 +791,19 @@ def pointmap_coverage_reward(
 
     return -penalties.to(pose_device)
 
+
+def sft_reward(pred_scale, pred_rotation, pred_translation, gt_scale, gt_rotation, gt_translation):
+    pred_scale_log = torch.log(pred_scale.squeeze(1) + 1e-6)
+    gt_scale_log = torch.log(gt_scale + 1e-6)
+    scale_diff_log = (pred_scale_log - gt_scale_log) ** 2  #(N, 3)
+    scale_reward = -scale_diff_log.mean(dim=-1)  # (N,)
+
+    rotation_reward = -((pred_rotation - gt_rotation) ** 2).mean(dim=-1)  # (N,)
+    translation_reward = -((pred_translation - gt_translation) ** 2).mean(dim=-1)  # (N,)
+
+    return scale_reward + rotation_reward + translation_reward
+
+
 def scale_reward(
     pred_scale: torch.Tensor,
     gt_scale: torch.Tensor,
@@ -828,7 +841,6 @@ def compute_reward(
         #"ground_penetration": ground_penetration_reward(meshes, scale, rotation, translation, camera_transform),
         "collision": object_intersection_reward_binary(meshes, scale, rotation, translation) + ground_penetration_reward_binary(meshes, scale, rotation, translation, camera_transform),
         # "pointmap_coverage": pointmap_coverage_reward(meshes, scale, rotation, translation, pointmap, masks),
-        "scale": scale_reward(scale, gt_scale) if gt_scale is not None else torch.zeros(len(meshes), device=scale.device),
     }
 
     gt_available = (
@@ -840,15 +852,12 @@ def compute_reward(
         and gt_mesh_available.any()
     )
     if gt_available:
-        result["gt_coverage"] = gt_coverage_reward(
-            meshes, scale, rotation, translation,
-            gt_mesh_points, gt_scale, gt_rotation_6d, gt_translation, gt_mesh_available,
-        )
+        result["sft"] = sft_reward(scale, rotation, translation, gt_scale, gt_rotation_6d, gt_translation)
 
         # print(result["gt_coverage"])
 
         for k in result:
-            if k != "gt_coverage" and k != "scale":
-                result[k] = result[k] * (result["gt_coverage"] > THRESHOLD_GT_COVERAGE).float()  # mask out rewards when GT coverage is very poor (threshold is a hyperparameter)
+            if k != "sft":
+                result[k] = result[k] * (result["sft"] > THRESHOLD_SFT).float()  # mask out rewards when GT coverage is very poor (threshold is a hyperparameter)
 
     return result
