@@ -272,7 +272,7 @@ def train_epoch_grpo(
                             q = rotation[obj_idx].squeeze(0).detach().cpu().float()         # (4,) [w,x,y,z]
                             t = translation[obj_idx].squeeze(0).detach().cpu().float().numpy()
 
-                            R = quaternion_to_matrix(q).numpy().T  # (3, 3)
+                            R = quaternion_to_matrix(q).numpy()  # (3, 3)
                             M = np.eye(4)
                             M[:3, :3] = R @ np.diag([1, 1, 1]) @ np.diag(s)
                             M[:3, 3] = t

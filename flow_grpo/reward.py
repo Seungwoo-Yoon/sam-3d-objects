@@ -10,7 +10,7 @@ import numpy as np
 
 from sam3d_objects.model.backbone.tdfy_dit.representations.mesh.cube2mesh import MeshExtractResult
 
-THRESHOLD_SFT = -0.5           # hyperparameter: objects with SFT below this get all other rewards masked out to zero
+THRESHOLD_SFT = -0.5          # hyperparameter: objects with SFT below this get all other rewards masked out to zero
 COLLISION_TOLERANCE = 0.99     # shrink meshes slightly to avoid false positives
 
 def extract_sdf_surface(sdf: torch.Tensor, res: int, dtype: torch.dtype) -> torch.Tensor | None:
@@ -792,13 +792,35 @@ def pointmap_coverage_reward(
     return -penalties.to(pose_device)
 
 
-def sft_reward(pred_scale, pred_rotation, pred_translation, gt_scale, gt_rotation, gt_translation):
-    pred_scale_log = torch.log(pred_scale.squeeze(1) + 1e-6)
+def sft_reward(pred_scale, pred_rotation, pred_translation, gt_scale, gt_rotation_6d, gt_translation):
+    pred_scale = pred_scale.squeeze(1)
+    pred_rotation = pred_rotation.squeeze(1)
+    pred_translation = pred_translation.squeeze(1)
+
+    if gt_scale.dim() == 3:
+        gt_scale = gt_scale.squeeze(1)
+    if gt_rotation_6d.dim() == 3:
+        gt_rotation_6d = gt_rotation_6d.squeeze(1)
+    if gt_translation.dim() == 3:
+        gt_translation = gt_translation.squeeze(1)
+
+    gt_scale = gt_scale.to(device=pred_scale.device, dtype=pred_scale.dtype)
+    gt_rotation_6d = gt_rotation_6d.to(device=pred_rotation.device, dtype=pred_rotation.dtype)
+    gt_translation = gt_translation.to(device=pred_translation.device, dtype=pred_translation.dtype)
+
+    pred_scale_log = torch.log(pred_scale + 1e-6)
     gt_scale_log = torch.log(gt_scale + 1e-6)
     scale_diff_log = (pred_scale_log - gt_scale_log) ** 2  #(N, 3)
     scale_reward = -scale_diff_log.mean(dim=-1)  # (N,)
 
-    rotation_reward = -((pred_rotation - gt_rotation) ** 2).mean(dim=-1)  # (N,)
+    # Match the dataset/debug convention: 6D rotation is the first two
+    # columns of the rotation matrix, concatenated as [col0, col1].
+    pred_rotation_matrix = quaternion_to_matrix(pred_rotation)
+    pred_rotation_6d = torch.cat(
+        [pred_rotation_matrix[..., :, 0], pred_rotation_matrix[..., :, 1]],
+        dim=-1,
+    )
+    rotation_reward = -((pred_rotation_6d - gt_rotation_6d) ** 2).mean(dim=-1)  # (N,)
     translation_reward = -((pred_translation - gt_translation) ** 2).mean(dim=-1)  # (N,)
 
     return scale_reward + rotation_reward + translation_reward
@@ -820,7 +842,7 @@ def scale_reward(
     scale_diff_log = (pred_scale_log - gt_scale_log) ** 2  #(N, 3)
 
     scale_reward = -scale_diff_log.mean(dim=-1)  # (N,)
-    return scale_reward
+    return scale_reward * 0.1
 
 def compute_reward(
     meshes: List[MeshExtractResult],
@@ -859,5 +881,7 @@ def compute_reward(
         for k in result:
             if k != "sft":
                 result[k] = result[k] * (result["sft"] > THRESHOLD_SFT).float()  # mask out rewards when GT coverage is very poor (threshold is a hyperparameter)
+
+        result["constant"] = torch.ones_like(result["sft"])
 
     return result
