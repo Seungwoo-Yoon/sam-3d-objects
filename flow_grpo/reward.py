@@ -865,23 +865,23 @@ def compute_reward(
         # "pointmap_coverage": pointmap_coverage_reward(meshes, scale, rotation, translation, pointmap, masks),
     }
 
-    gt_available = (
-        gt_mesh_points is not None
-        and gt_scale is not None
-        and gt_rotation_6d is not None
-        and gt_translation is not None
-        and gt_mesh_available is not None
-        and gt_mesh_available.any()
-    )
-    if gt_available:
-        result["sft"] = sft_reward(scale, rotation, translation, gt_scale, gt_rotation_6d, gt_translation)
+    # gt_available = (
+    #     gt_mesh_points is not None
+    #     and gt_scale is not None
+    #     and gt_rotation_6d is not None
+    #     and gt_translation is not None
+    #     and gt_mesh_available is not None
+    #     and gt_mesh_available.any()
+    # )
+    # if gt_available:
+    #     result["sft"] = sft_reward(scale, rotation, translation, gt_scale, gt_rotation_6d, gt_translation)
 
-        # print(result["gt_coverage"])
+    #     # print(result["gt_coverage"])
 
-        for k in result:
-            if k != "sft":
-                result[k] = result[k] * (result["sft"] > THRESHOLD_SFT).float()  # mask out rewards when GT coverage is very poor (threshold is a hyperparameter)
+    #     for k in result:
+    #         if k != "sft":
+    #             result[k] = result[k] * (result["sft"] > THRESHOLD_SFT).float()  # mask out rewards when GT coverage is very poor (threshold is a hyperparameter)
 
-        result["constant"] = torch.ones_like(result["sft"])
+    #     result["constant"] = torch.ones_like(result["sft"])
 
     return result

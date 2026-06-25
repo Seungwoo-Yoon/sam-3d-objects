@@ -386,7 +386,8 @@ def main(args):
         f"Starting Flow-GRPO-Fast: {args.num_epochs} epochs, "
         f"G={args.group_size}, T_train={args.t_train_steps}, T_sde={args.t_sde_steps}, "
         f"generation_batch_size={args.generation_batch_size}, "
-        f"sde_a={args.sde_a}, kl_coeff={args.kl_coeff}"
+        f"sde_a={args.sde_a}, kl_coeff={args.kl_coeff}, "
+        f"sft_loss_weight={args.sft_loss_weight}"
     )
 
     for epoch in range(start_epoch, args.num_epochs):
@@ -425,6 +426,7 @@ def main(args):
             generation_batch_size=args.generation_batch_size,
             decode_batch_size=args.decode_batch_size,
             adv_stats=adv_stats,
+            sft_loss_weight=args.sft_loss_weight,
         )
         global_step += len(train_loader)
 
@@ -434,6 +436,8 @@ def main(args):
                 f"Epoch {epoch}: loss={epoch_metrics['loss']:.4f}, "
                 f"pg={epoch_metrics['pg_loss']:.4f}, "
                 f"kl={epoch_metrics['kl_loss']:.4f}, "
+                f"sft={epoch_metrics['sft_loss']:.4f}, "
+                f"sft_w={epoch_metrics['sft_weighted_loss']:.4f}, "
                 f"reward={epoch_metrics['reward_mean']:.4f}, "
                 f"adv_global_mean={adv_stats.mean:.4f}, adv_global_std={adv_stats.std:.4f} "
                 f"(n={adv_stats.count})"
@@ -442,6 +446,9 @@ def main(args):
                 log_metrics(exp_logger, {
                     "epoch/loss": epoch_metrics["loss"],
                     "epoch/reward_mean": epoch_metrics["reward_mean"],
+                    "epoch/sft_loss": epoch_metrics["sft_loss"],
+                    "epoch/sft_weighted_loss": epoch_metrics["sft_weighted_loss"],
+                    "epoch/sft_loss_weight": args.sft_loss_weight,
                     "epoch/adv_global_mean": adv_stats.mean,
                     "epoch/adv_global_std": adv_stats.std,
                 }, global_step)
@@ -543,6 +550,9 @@ if __name__ == "__main__":
                         help="PPO clipping epsilon")
     parser.add_argument("--cfg_strength", type=float, default=7.0,
                         help="CFG strength during SDE generation")
+    parser.add_argument("--sft_loss_weight", type=float, default=1.0,
+                        help="Lambda for true flow-matching SFT on generated x_t/t: "
+                             "L = L_RL + lambda * L_SFT. Set 0 to disable.")
 
     # ---- Memory optimizations ----
     parser.add_argument("--gradient_checkpointing", action="store_true", default=False,

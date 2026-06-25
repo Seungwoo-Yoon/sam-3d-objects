@@ -1,14 +1,40 @@
 """GRPO loss computation with per-step backward for memory efficiency."""
 
 import logging
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
+from collections.abc import Mapping
 
+import optree
 import torch
 import torch.nn as nn
 
 from .sde import sde_mu_dict
 
 logger = logging.getLogger(__name__)
+
+
+def _flow_matching_target_from_xt(
+    x_t: Dict[str, torch.Tensor],
+    x1: Dict[str, torch.Tensor],
+    t: float,
+    sigma_min: float,
+) -> Dict[str, torch.Tensor]:
+    """
+    Recover the rectified-flow target for a generated input x_t.
+
+    The model's standard FM path samples
+        x_t = (1 - (1 - sigma_min) * t) * x0 + t * x1
+        target = x1 - (1 - sigma_min) * x0
+
+    For trajectory-based SFT we already have x_t from generation, so invert the
+    first equation and build the same target without sampling a fresh x0.
+    """
+    beta = 1.0 - float(sigma_min)
+    denom = max(1.0 - beta * float(t), 1e-6)
+    return {
+        k: (x1[k].to(device=v.device, dtype=v.dtype) - beta * v) / denom
+        for k, v in x1.items()
+    }
 
 
 def compute_grpo_loss_single(
@@ -22,7 +48,9 @@ def compute_grpo_loss_single(
     kl_coeff: float = 0.04,
     clip_epsilon: float = 0.2,
     time_scale: float = 1000.0,
-) -> Tuple[float, float]:
+    sft_target_latents: Optional[Dict[str, torch.Tensor]] = None,
+    sft_loss_weight: float = 0.0,
+) -> Tuple[float, float, float]:
     """
     Compute and immediately back-propagate the GRPO loss for a SINGLE trajectory.
 
@@ -34,7 +62,11 @@ def compute_grpo_loss_single(
     immediately, so at most ONE forward-pass activation graph lives in memory
     at any given time.
 
-    Returns (pg_sum_scalar, kl_sum_scalar) for logging only.
+    If sft_target_latents is provided and sft_loss_weight > 0, add a true
+    flow-matching SFT objective on the same generated x_t/t pairs used by GRPO:
+        L = L_RL + lambda * L_SFT
+
+    Returns (pg_sum_scalar, kl_sum_scalar, sft_sum_scalar) for logging only.
     """
     T     = len(traj["t_steps"])
     adv_t = adv_g.to(device=device, dtype=torch.float32)  # (N_obj,)
@@ -42,9 +74,12 @@ def compute_grpo_loss_single(
 
     total_pg_val = 0.0
     total_kl_val = 0.0
+    total_sft_val = 0.0
 
     excluded = {'shape', 'translation_scale'}
     noisy_key = traj.get("noisy_key", None)
+    use_sft = sft_target_latents is not None and sft_loss_weight > 0.0
+    sigma_min = float(getattr(model, "sigma_min", 0.0))
 
     for step_idx in range(T):
         t     = traj["t_steps"][step_idx]
@@ -75,6 +110,41 @@ def compute_grpo_loss_single(
         pg_clipped   = ratio.clamp(1.0 - clip_epsilon, 1.0 + clip_epsilon) * adv_t
         pg_loss      = -torch.min(pg_unclipped, pg_clipped).sum()  # sum over objects
 
+        if use_sft:
+            sft_target = _flow_matching_target_from_xt(
+                x_t=x_t,
+                x1=sft_target_latents,
+                t=t,
+                sigma_min=sigma_min,
+            )
+            sft_pred = {k: v for k, v in v_new.items() if k not in excluded}
+            sft_target = {k: v for k, v in sft_target.items() if k not in excluded}
+            sft_loss_weights = (
+                {k: model.loss_weights.get(k, 1.0) for k in sft_pred}
+                if isinstance(model.loss_weights, Mapping)
+                else model.loss_weights
+            )
+            sft_loss_fn = (
+                {
+                    k: model.loss_fn.get(
+                        k, torch.nn.functional.mse_loss
+                    )
+                    for k in sft_pred
+                }
+                if isinstance(model.loss_fn, Mapping)
+                else model.loss_fn
+            )
+            sft_loss = optree.tree_broadcast_map(
+                lambda fn, weight, pred, targ: weight * fn(pred.float(), targ.float()),
+                sft_loss_fn,
+                sft_loss_weights,
+                sft_pred,
+                sft_target,
+            )
+            sft_loss_val = sum(optree.tree_flatten(sft_loss)[0])
+        else:
+            sft_loss_val = torch.zeros((), device=device, dtype=torch.float32)
+
         # kl gradient via register_hook — lets us free v_ref before backward
         # d(kl)/d(v_new[k]) = 2*(v_new[k] - v_ref[k]) / numel, injected as a hook
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -95,10 +165,13 @@ def compute_grpo_loss_single(
             kl_val = 0.0
 
         pg_val = pg_loss.item()
-        (pg_loss / n_terms).backward()  # pg grad + injected kl grad in one pass
-        del v_new, pg_loss
+        sft_val = sft_loss_val.item()
+        total_step_loss = pg_loss + sft_loss_weight * sft_loss_val
+        (total_step_loss / n_terms).backward()  # pg + sft grad + injected kl grad
+        del v_new, pg_loss, sft_loss_val, total_step_loss
 
         total_pg_val += pg_val
         total_kl_val += kl_val
+        total_sft_val += sft_val
 
-    return total_pg_val, total_kl_val
+    return total_pg_val, total_kl_val, total_sft_val
