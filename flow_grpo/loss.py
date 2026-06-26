@@ -20,11 +20,12 @@ def _flow_matching_target_from_xt(
     sigma_min: float,
 ) -> Dict[str, torch.Tensor]:
     """
-    Recover the rectified-flow target for a generated input x_t.
+    Recover the rectified-flow target for a generated input x_t. (~= DAgger)
 
     The model's standard FM path samples
         x_t = (1 - (1 - sigma_min) * t) * x0 + t * x1
-        target = x1 - (1 - sigma_min) * x0
+        target  = x1 - (1 - sigma_min) * x0
+                = (x1 - beta * x_t) / (1 - beta * t)
 
     For trajectory-based SFT we already have x_t from generation, so invert the
     first equation and build the same target without sampling a fresh x0.
@@ -33,7 +34,7 @@ def _flow_matching_target_from_xt(
     denom = max(1.0 - beta * float(t), 1e-6)
     return {
         k: (x1[k].to(device=v.device, dtype=v.dtype) - beta * v) / denom
-        for k, v in x1.items()
+        for k, v in x_t.items()
     }
 
 

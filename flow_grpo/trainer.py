@@ -117,9 +117,12 @@ def _prepare_sft_target_latents(
     device: torch.device,
 ) -> Dict[str, torch.Tensor]:
     """Prepare GT latents in the same model space used by FM training."""
-    model_rotation_6d = _dataset_rotation_6d_to_model_rotation_6d(
-        gt_latents["6drotation_normalized"]
-    )
+    model_rotation_6d = gt_latents["6drotation_normalized"]
+    
+    # model_rotation_6d = _dataset_rotation_6d_to_model_rotation_6d(
+    #     gt_latents["6drotation_normalized"]
+    # )
+    
     latents = {
         "scale": gt_latents["scale"].unsqueeze(1),
         "6drotation_normalized": model_rotation_6d.unsqueeze(1),
